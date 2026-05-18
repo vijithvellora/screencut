@@ -711,22 +711,87 @@ class BlurPanel(QWidget):
             sp.setSuffix("s")
             sp.setStyleSheet("""
                 QDoubleSpinBox {
-                    background: #0d0d18; color: #ccc;
+                    background: #0d0d18; color: #eee;
                     border: 1px solid #333; border-radius: 4px;
-                    padding: 2px 4px; font: 10px 'SF Mono';
+                    padding: 4px 6px; font: 11px 'SF Mono'; font-weight: bold;
+                    min-height: 24px;
                 }
+                QDoubleSpinBox::up-button {
+                    subcontrol-origin: border;
+                    subcontrol-position: right top;
+                    width: 20px; height: 12px;
+                    border: none; background: #1a1a28;
+                }
+                QDoubleSpinBox::up-button:hover { background: #252538; }
+                QDoubleSpinBox::down-button {
+                    subcontrol-origin: border;
+                    subcontrol-position: right bottom;
+                    width: 20px; height: 12px;
+                    border: none; background: #1a1a28;
+                }
+                QDoubleSpinBox::down-button:hover { background: #252538; }
             """)
-            sp.setFixedWidth(72)
+            sp.setMinimumWidth(90)
+            sp.setCursor(Qt.CursorShape.ArrowCursor)
+
             def on_change(v, a=attr, r=region):
                 setattr(r, a, v)
                 self.region_updated.emit()
             sp.valueChanged.connect(on_change)
+
+            # Support Shift+scroll/arrow for faster adjustment
+            original_wheelEvent = sp.wheelEvent
+            def wheel_event(event, orig=original_wheelEvent):
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    sp.setSingleStep(1.0)
+                    orig(event)
+                    sp.setSingleStep(0.1)
+                else:
+                    orig(event)
+            sp.wheelEvent = wheel_event
+
             return sp
 
         time_row.addWidget(QLabel("<span style='color:#666;font:9px SF Mono'>START</span>"))
-        time_row.addWidget(make_spin(br.start_time, duration, 'start_time', br))
+        start_spin = make_spin(br.start_time, duration, 'start_time', br)
+        time_row.addWidget(start_spin)
+
+        # Quick adjust buttons for start
+        start_adj = QHBoxLayout()
+        start_adj.setSpacing(2)
+        for delta, label in [(-1.0, "−1s"), (-0.1, "−0.1s"), (+0.1, "+0.1s"), (+1.0, "+1s")]:
+            btn = QPushButton(label)
+            btn.setFixedSize(40, 22)
+            btn.setStyleSheet("""
+                QPushButton { background: #1a1a28; color: #666; border: 1px solid #2a2a3a;
+                            border-radius: 3px; font: 7px 'SF Mono'; padding: 0px; }
+                QPushButton:hover { background: #252538; color: #aaa; }
+            """)
+            btn.clicked.connect(lambda _, d=delta: start_spin.setValue(max(0, start_spin.value() + d)))
+            start_adj.addWidget(btn)
+        time_row.addLayout(start_adj)
+
+        time_row.addSpacing(12)
+
         time_row.addWidget(QLabel("<span style='color:#666;font:9px SF Mono'>END</span>"))
-        time_row.addWidget(make_spin(br.end_time, duration, 'end_time', br))
+        end_spin = make_spin(br.end_time, duration, 'end_time', br)
+        time_row.addWidget(end_spin)
+
+        # Quick adjust buttons for end
+        end_adj = QHBoxLayout()
+        end_adj.setSpacing(2)
+        for delta, label in [(-1.0, "−1s"), (-0.1, "−0.1s"), (+0.1, "+0.1s"), (+1.0, "+1s")]:
+            btn = QPushButton(label)
+            btn.setFixedSize(40, 22)
+            btn.setStyleSheet("""
+                QPushButton { background: #1a1a28; color: #666; border: 1px solid #2a2a3a;
+                            border-radius: 3px; font: 7px 'SF Mono'; padding: 0px; }
+                QPushButton:hover { background: #252538; color: #aaa; }
+            """)
+            btn.clicked.connect(lambda _, d=delta: end_spin.setValue(min(duration, end_spin.value() + d)))
+            end_adj.addWidget(btn)
+        time_row.addLayout(end_adj)
+
         time_row.addStretch()
         layout.addLayout(time_row)
 
