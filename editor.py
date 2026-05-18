@@ -760,7 +760,7 @@ class BlurPanel(QWidget):
         start_btn_layout = QHBoxLayout()
         start_btn_layout.setSpacing(2)
         start_btn_layout.setContentsMargins(0, 0, 0, 0)
-        for delta, label in [("−", -0.1), ("+", +0.1)]:
+        for label, delta in [("−", -0.1), ("+", +0.1)]:
             btn = QPushButton(label)
             btn.setFixedSize(24, 22)
             btn.setStyleSheet("""
@@ -781,7 +781,7 @@ class BlurPanel(QWidget):
         end_btn_layout = QHBoxLayout()
         end_btn_layout.setSpacing(2)
         end_btn_layout.setContentsMargins(0, 0, 0, 0)
-        for delta, label in [("−", -0.1), ("+", +0.1)]:
+        for label, delta in [("−", -0.1), ("+", +0.1)]:
             btn = QPushButton(label)
             btn.setFixedSize(24, 22)
             btn.setStyleSheet("""
