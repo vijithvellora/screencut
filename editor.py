@@ -1034,70 +1034,98 @@ class ScreenCut(QMainWindow):
         panel.setStyleSheet("background: #0b0b15; border-left: 1px solid #181828;")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
-        # Video info
-        self.info_group = QGroupBox("VIDEO INFO")
+        # Collapsible Video Info
+        info_box = QHBoxLayout()
+        info_btn = QPushButton("ℹ Video Info")
+        info_btn.setCheckable(True)
+        info_btn.setFixedHeight(26)
+        info_btn.setStyleSheet("""
+            QPushButton {
+                background: #141420; color: #666; border: 1px solid #2a2a3a;
+                border-radius: 4px; font: 9px 'SF Mono'; padding: 0px 8px;
+            }
+            QPushButton:hover { color: #aaa; background: #1a1a28; }
+            QPushButton:checked { background: #1a2535; color: #00d4ff; border-color: #00d4ff; }
+        """)
+        info_box.addWidget(info_btn)
+        info_box.addStretch()
+        layout.addLayout(info_box)
+
+        self.info_group = QGroupBox()
+        self.info_group.setVisible(False)
         info_layout = QGridLayout(self.info_group)
         info_layout.setSpacing(4)
+        info_layout.setContentsMargins(0, 6, 0, 0)
         self.info_labels = {}
         for i, (k, v) in enumerate([("File", "—"), ("Duration", "—"), ("Resolution", "—"), ("FPS", "—")]):
             lbl = QLabel(k + ":")
-            lbl.setStyleSheet("color: #555; font: 9px 'SF Mono'; letter-spacing: 1px;")
+            lbl.setStyleSheet("color: #555; font: 8px 'SF Mono'; letter-spacing: 1px;")
             val = QLabel(v)
-            val.setStyleSheet("color: #bbb; font: 10px 'SF Mono';")
+            val.setStyleSheet("color: #bbb; font: 9px 'SF Mono';")
             val.setWordWrap(True)
             info_layout.addWidget(lbl, i, 0)
             info_layout.addWidget(val, i, 1)
             self.info_labels[k] = val
+        info_btn.toggled.connect(self.info_group.setVisible)
         layout.addWidget(self.info_group)
 
-        # Trim
+        # Trim (compact)
         trim_group = QGroupBox("TRIM")
-        trim_layout = QGridLayout(trim_group)
-        trim_layout.setSpacing(6)
+        trim_layout = QHBoxLayout(trim_group)
+        trim_layout.setSpacing(8)
+        trim_layout.setContentsMargins(8, 6, 8, 6)
 
-        trim_layout.addWidget(QLabel("In:"), 0, 0)
         self.trim_start_lbl = QLabel("0.00s")
-        self.trim_start_lbl.setStyleSheet("color: #00d4ff; font: 11px 'SF Mono';")
-        trim_layout.addWidget(self.trim_start_lbl, 0, 1)
-
-        trim_layout.addWidget(QLabel("Out:"), 1, 0)
+        self.trim_start_lbl.setStyleSheet("color: #00d4ff; font: 10px 'SF Mono'; min-width: 50px;")
         self.trim_end_lbl = QLabel("—")
-        self.trim_end_lbl.setStyleSheet("color: #00d4ff; font: 11px 'SF Mono';")
-        trim_layout.addWidget(self.trim_end_lbl, 1, 1)
-
-        reset_trim = QPushButton("Reset Trim")
+        self.trim_end_lbl.setStyleSheet("color: #00d4ff; font: 10px 'SF Mono'; min-width: 50px;")
+        reset_trim = QPushButton("Reset")
+        reset_trim.setFixedHeight(24)
+        reset_trim.setFixedWidth(60)
+        reset_trim.setStyleSheet("font: 9px 'SF Mono'; padding: 0px;")
         reset_trim.clicked.connect(self._reset_trim)
-        trim_layout.addWidget(reset_trim, 2, 0, 1, 2)
+
+        trim_layout.addWidget(QLabel("In:"), 0)
+        trim_layout.addWidget(self.trim_start_lbl, 0)
+        trim_layout.addWidget(QLabel("Out:"), 0)
+        trim_layout.addWidget(self.trim_end_lbl, 0)
+        trim_layout.addWidget(reset_trim, 0)
+        trim_layout.addStretch()
         layout.addWidget(trim_group)
 
-        # Speed
+        # Speed (compact with dropdown + slider)
         speed_group = QGroupBox("SPEED")
         speed_layout = QVBoxLayout(speed_group)
+        speed_layout.setSpacing(6)
+        speed_layout.setContentsMargins(8, 6, 8, 6)
 
-        speed_row = QHBoxLayout()
+        speed_top = QHBoxLayout()
         self.speed_label = QLabel("1.0×")
-        self.speed_label.setStyleSheet("color: #ffb340; font: bold 18px 'SF Mono'; min-width: 52px;")
-        speed_row.addWidget(self.speed_label)
+        self.speed_label.setStyleSheet("color: #ffb340; font: bold 14px 'SF Mono'; min-width: 45px;")
+        speed_top.addWidget(self.speed_label)
 
-        presets = QHBoxLayout()
-        for sp in [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]:
-            btn = QPushButton(f"{sp}×")
-            btn.setFixedSize(40, 26)
-            btn.setStyleSheet("""
-                QPushButton { background: #141425; color: #888; border: 1px solid #222236;
-                              border-radius: 4px; font: 10px 'SF Mono'; }
-                QPushButton:hover { background: #1e1e35; color: #eee; }
-            """)
-            btn.clicked.connect(lambda _, s=sp: self._set_speed(s))
-            presets.addWidget(btn)
-        speed_layout.addLayout(speed_row)
-        speed_layout.addLayout(presets)
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["0.5×", "1.0×", "1.5×", "2.0×", "3.0×", "4.0×"])
+        self.speed_combo.setCurrentText("1.0×")
+        self.speed_combo.setFixedHeight(24)
+        self.speed_combo.setStyleSheet("""
+            QComboBox {
+                background: #141420; color: #ccc; border: 1px solid #2a2a3a;
+                border-radius: 4px; padding: 2px 6px; font: 9px 'SF Mono';
+            }
+            QComboBox::drop-down { border: none; width: 20px; }
+        """)
+        self.speed_combo.currentTextChanged.connect(lambda t: self._set_speed(float(t[:-1])))
+        speed_top.addWidget(self.speed_combo)
+        speed_top.addStretch()
+        speed_layout.addLayout(speed_top)
 
         self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(25, 800)  # 0.25x to 8x
+        self.speed_slider.setRange(25, 800)
         self.speed_slider.setValue(100)
+        self.speed_slider.setFixedHeight(16)
         self.speed_slider.valueChanged.connect(lambda v: self._set_speed(v / 100))
         speed_layout.addWidget(self.speed_slider)
         layout.addWidget(speed_group)
@@ -1408,6 +1436,13 @@ class ScreenCut(QMainWindow):
         self.speed_slider.blockSignals(True)
         self.speed_slider.setValue(int(speed * 100))
         self.speed_slider.blockSignals(False)
+        # Sync dropdown
+        self.speed_combo.blockSignals(True)
+        for i in range(self.speed_combo.count()):
+            if abs(float(self.speed_combo.itemText(i)[:-1]) - speed) < 0.01:
+                self.speed_combo.setCurrentIndex(i)
+                break
+        self.speed_combo.blockSignals(False)
 
     # ─── Export ───────────────────────────────────────────────────────────────
 
