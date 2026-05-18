@@ -1070,50 +1070,56 @@ class ScreenCut(QMainWindow):
             self.info_labels[k] = QLabel("—")
         info_btn.toggled.connect(self.info_group.setVisible)
 
-        # Trim (single line, ultra-compact)
+        # Trim (single line)
         trim_row = QHBoxLayout()
-        trim_row.setSpacing(4)
+        trim_row.setSpacing(6)
         trim_row.setContentsMargins(0, 0, 0, 0)
 
+        trim_lbl = QLabel("TRIM:")
+        trim_lbl.setStyleSheet("color: #666; font: 8px 'SF Mono'; font-weight: bold;")
         self.trim_start_lbl = QLabel("0.00s")
-        self.trim_start_lbl.setStyleSheet("color: #00d4ff; font: 9px 'SF Mono'; min-width: 40px; text-align: right;")
+        self.trim_start_lbl.setStyleSheet("color: #00d4ff; font: 9px 'SF Mono'; min-width: 45px;")
         self.trim_end_lbl = QLabel("—")
-        self.trim_end_lbl.setStyleSheet("color: #00d4ff; font: 9px 'SF Mono'; min-width: 40px; text-align: right;")
+        self.trim_end_lbl.setStyleSheet("color: #00d4ff; font: 9px 'SF Mono'; min-width: 45px;")
 
         reset_trim = QPushButton("⟲")
-        reset_trim.setFixedSize(28, 28)
-        reset_trim.setStyleSheet("background: #141420; color: #666; border: 1px solid #2a2a3a; border-radius: 4px; font: 12px; padding: 0px;")
+        reset_trim.setFixedSize(26, 26)
+        reset_trim.setStyleSheet("background: #141420; color: #666; border: 1px solid #2a2a3a; border-radius: 3px; font: 11px; padding: 0px;")
         reset_trim.clicked.connect(self._reset_trim)
 
-        trim_row.addWidget(QLabel("TRIM:"), 0)
+        trim_row.addWidget(trim_lbl, 0)
         trim_row.addWidget(self.trim_start_lbl, 0)
         trim_row.addWidget(QLabel("→"), 0)
         trim_row.addWidget(self.trim_end_lbl, 0)
         trim_row.addWidget(reset_trim, 0)
         trim_row.addStretch()
 
-        # Speed (single line, ultra-compact)
+        # Speed (single line)
         speed_row = QHBoxLayout()
-        speed_row.setSpacing(4)
+        speed_row.setSpacing(6)
         speed_row.setContentsMargins(0, 0, 0, 0)
 
+        speed_lbl = QLabel("SPEED:")
+        speed_lbl.setStyleSheet("color: #666; font: 8px 'SF Mono'; font-weight: bold;")
         self.speed_label = QLabel("1.0×")
-        self.speed_label.setStyleSheet("color: #ffb340; font: 10px 'SF Mono'; font-weight: bold; min-width: 32px;")
+        self.speed_label.setStyleSheet("color: #ffb340; font: 10px 'SF Mono'; font-weight: bold; min-width: 35px;")
 
         self.speed_combo = QComboBox()
         self.speed_combo.addItems(["0.5×", "1.0×", "1.5×", "2.0×", "3.0×", "4.0×"])
         self.speed_combo.setCurrentText("1.0×")
-        self.speed_combo.setFixedHeight(28)
-        self.speed_combo.setMaximumWidth(70)
+        self.speed_combo.setFixedHeight(26)
+        self.speed_combo.setFixedWidth(75)
         self.speed_combo.setStyleSheet("""
             QComboBox {
                 background: #141420; color: #ccc; border: 1px solid #2a2a3a;
-                border-radius: 4px; padding: 2px 6px; font: 8px 'SF Mono';
+                border-radius: 3px; padding: 2px 4px; font: 8px 'SF Mono';
             }
+            QComboBox::drop-down { border: none; }
+            QComboBox::down-arrow { image: url(none); }
         """)
         self.speed_combo.currentTextChanged.connect(lambda t: self._set_speed(float(t[:-1])))
 
-        speed_row.addWidget(QLabel("SPEED:"), 0)
+        speed_row.addWidget(speed_lbl, 0)
         speed_row.addWidget(self.speed_label, 0)
         speed_row.addWidget(self.speed_combo, 0)
         speed_row.addStretch()
@@ -1121,7 +1127,7 @@ class ScreenCut(QMainWindow):
         # Add all control rows to a container
         controls = QWidget()
         controls_layout = QVBoxLayout(controls)
-        controls_layout.setSpacing(6)
+        controls_layout.setSpacing(5)
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
         info_row = QHBoxLayout()
@@ -1130,22 +1136,22 @@ class ScreenCut(QMainWindow):
         controls_layout.addLayout(info_row)
         controls_layout.addWidget(self.info_group)
         controls_layout.addLayout(trim_row)
+        controls_layout.addLayout(speed_row)
 
-        # Speed slider (separate from row for better visibility)
+        # Speed slider
         self.speed_slider = QSlider(Qt.Orientation.Horizontal)
         self.speed_slider.setRange(25, 800)
         self.speed_slider.setValue(100)
-        self.speed_slider.setFixedHeight(14)
+        self.speed_slider.setFixedHeight(12)
         self.speed_slider.setStyleSheet("""
-            QSlider::groove:horizontal { background: #141420; border-radius: 4px; height: 4px; }
-            QSlider::handle:horizontal { background: #ffb340; border: none; width: 10px; margin: -3px 0; border-radius: 5px; }
+            QSlider::groove:horizontal { background: #141420; border-radius: 3px; height: 3px; margin: 0px 0px; }
+            QSlider::handle:horizontal { background: #ffb340; border: none; width: 8px; margin: -4px 0px; border-radius: 4px; }
         """)
         self.speed_slider.valueChanged.connect(lambda v: self._set_speed(v / 100))
-        controls_layout.addLayout(speed_row)
         controls_layout.addWidget(self.speed_slider)
 
         layout.addWidget(controls)
-        layout.addSpacing(4)
+        layout.addSpacing(6)
 
         # ─── Main Blur Panel (takes most space) ────────────────────────────────
 
