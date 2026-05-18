@@ -153,8 +153,8 @@ class ExportWorker(QThread):
                 pw = min(pw, vw - px)
                 ph = min(ph, vh - py)
                 # Make even (required by libx264 subsampling)
-                pw = pw - (pw % 2)
-                ph = ph - (ph % 2)
+                pw = max(2, pw - (pw % 2))
+                ph = max(2, ph - (ph % 2))
 
                 out_label = f"[v{i}]"
 
@@ -213,6 +213,9 @@ class ExportWorker(QThread):
             self.progress.emit(15, "Building filter graph…")
 
             # Print filter for debugging
+            print("=== Export Settings ===")
+            print(f"Speed: {s.speed}x")
+            print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s")
             print("=== FFmpeg filter_complex ===")
             print(full_filter)
             print("=============================")
@@ -1111,6 +1114,9 @@ class ScreenCut(QMainWindow):
         self.timeline.blur_regions = []
         self.timeline.thumbnails = []
         self.timeline.update()
+
+        # Reset speed UI to match new session
+        self._set_speed(1.0)
 
         self._seek_to(0)
 
