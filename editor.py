@@ -1033,130 +1033,158 @@ class ScreenCut(QMainWindow):
         panel = QWidget()
         panel.setStyleSheet("background: #0b0b15; border-left: 1px solid #181828;")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
 
-        # Collapsible Video Info
-        info_box = QHBoxLayout()
-        info_btn = QPushButton("ℹ Video Info")
+        # ─── Compact Controls Section ──────────────────────────────────────────
+
+        # Video Info (collapsible, minimal space)
+        info_btn = QPushButton("ℹ")
         info_btn.setCheckable(True)
-        info_btn.setFixedHeight(26)
+        info_btn.setFixedSize(28, 28)
         info_btn.setStyleSheet("""
             QPushButton {
-                background: #141420; color: #666; border: 1px solid #2a2a3a;
-                border-radius: 4px; font: 9px 'SF Mono'; padding: 0px 8px;
+                background: #141420; color: #555; border: 1px solid #2a2a3a;
+                border-radius: 4px; font: 12px; padding: 0px;
             }
-            QPushButton:hover { color: #aaa; background: #1a1a28; }
+            QPushButton:hover { color: #888; background: #1a1a28; }
             QPushButton:checked { background: #1a2535; color: #00d4ff; border-color: #00d4ff; }
         """)
-        info_box.addWidget(info_btn)
-        info_box.addStretch()
-        layout.addLayout(info_box)
-
         self.info_group = QGroupBox()
         self.info_group.setVisible(False)
         info_layout = QGridLayout(self.info_group)
-        info_layout.setSpacing(4)
-        info_layout.setContentsMargins(0, 6, 0, 0)
+        info_layout.setSpacing(3)
+        info_layout.setContentsMargins(6, 6, 6, 6)
         self.info_labels = {}
-        for i, (k, v) in enumerate([("File", "—"), ("Duration", "—"), ("Resolution", "—"), ("FPS", "—")]):
+        for i, (k, v) in enumerate([("File", "—"), ("Duration", "—")]):
             lbl = QLabel(k + ":")
-            lbl.setStyleSheet("color: #555; font: 8px 'SF Mono'; letter-spacing: 1px;")
+            lbl.setStyleSheet("color: #555; font: 7px 'SF Mono'; letter-spacing: 0.5px;")
             val = QLabel(v)
-            val.setStyleSheet("color: #bbb; font: 9px 'SF Mono';")
+            val.setStyleSheet("color: #999; font: 8px 'SF Mono';")
             val.setWordWrap(True)
             info_layout.addWidget(lbl, i, 0)
             info_layout.addWidget(val, i, 1)
             self.info_labels[k] = val
+        # Add remaining labels for compatibility
+        for k in ["Resolution", "FPS"]:
+            self.info_labels[k] = QLabel("—")
         info_btn.toggled.connect(self.info_group.setVisible)
-        layout.addWidget(self.info_group)
 
-        # Trim (compact)
-        trim_group = QGroupBox("TRIM")
-        trim_layout = QHBoxLayout(trim_group)
-        trim_layout.setSpacing(8)
-        trim_layout.setContentsMargins(8, 6, 8, 6)
+        # Trim (single line, ultra-compact)
+        trim_row = QHBoxLayout()
+        trim_row.setSpacing(4)
+        trim_row.setContentsMargins(0, 0, 0, 0)
 
         self.trim_start_lbl = QLabel("0.00s")
-        self.trim_start_lbl.setStyleSheet("color: #00d4ff; font: 10px 'SF Mono'; min-width: 50px;")
+        self.trim_start_lbl.setStyleSheet("color: #00d4ff; font: 9px 'SF Mono'; min-width: 40px; text-align: right;")
         self.trim_end_lbl = QLabel("—")
-        self.trim_end_lbl.setStyleSheet("color: #00d4ff; font: 10px 'SF Mono'; min-width: 50px;")
-        reset_trim = QPushButton("Reset")
-        reset_trim.setFixedHeight(24)
-        reset_trim.setFixedWidth(60)
-        reset_trim.setStyleSheet("font: 9px 'SF Mono'; padding: 0px;")
+        self.trim_end_lbl.setStyleSheet("color: #00d4ff; font: 9px 'SF Mono'; min-width: 40px; text-align: right;")
+
+        reset_trim = QPushButton("⟲")
+        reset_trim.setFixedSize(28, 28)
+        reset_trim.setStyleSheet("background: #141420; color: #666; border: 1px solid #2a2a3a; border-radius: 4px; font: 12px; padding: 0px;")
         reset_trim.clicked.connect(self._reset_trim)
 
-        trim_layout.addWidget(QLabel("In:"), 0)
-        trim_layout.addWidget(self.trim_start_lbl, 0)
-        trim_layout.addWidget(QLabel("Out:"), 0)
-        trim_layout.addWidget(self.trim_end_lbl, 0)
-        trim_layout.addWidget(reset_trim, 0)
-        trim_layout.addStretch()
-        layout.addWidget(trim_group)
+        trim_row.addWidget(QLabel("TRIM:"), 0)
+        trim_row.addWidget(self.trim_start_lbl, 0)
+        trim_row.addWidget(QLabel("→"), 0)
+        trim_row.addWidget(self.trim_end_lbl, 0)
+        trim_row.addWidget(reset_trim, 0)
+        trim_row.addStretch()
 
-        # Speed (compact with dropdown + slider)
-        speed_group = QGroupBox("SPEED")
-        speed_layout = QVBoxLayout(speed_group)
-        speed_layout.setSpacing(6)
-        speed_layout.setContentsMargins(8, 6, 8, 6)
+        # Speed (single line, ultra-compact)
+        speed_row = QHBoxLayout()
+        speed_row.setSpacing(4)
+        speed_row.setContentsMargins(0, 0, 0, 0)
 
-        speed_top = QHBoxLayout()
         self.speed_label = QLabel("1.0×")
-        self.speed_label.setStyleSheet("color: #ffb340; font: bold 14px 'SF Mono'; min-width: 45px;")
-        speed_top.addWidget(self.speed_label)
+        self.speed_label.setStyleSheet("color: #ffb340; font: 10px 'SF Mono'; font-weight: bold; min-width: 32px;")
 
         self.speed_combo = QComboBox()
         self.speed_combo.addItems(["0.5×", "1.0×", "1.5×", "2.0×", "3.0×", "4.0×"])
         self.speed_combo.setCurrentText("1.0×")
-        self.speed_combo.setFixedHeight(24)
+        self.speed_combo.setFixedHeight(28)
+        self.speed_combo.setMaximumWidth(70)
         self.speed_combo.setStyleSheet("""
             QComboBox {
                 background: #141420; color: #ccc; border: 1px solid #2a2a3a;
-                border-radius: 4px; padding: 2px 6px; font: 9px 'SF Mono';
+                border-radius: 4px; padding: 2px 6px; font: 8px 'SF Mono';
             }
-            QComboBox::drop-down { border: none; width: 20px; }
         """)
         self.speed_combo.currentTextChanged.connect(lambda t: self._set_speed(float(t[:-1])))
-        speed_top.addWidget(self.speed_combo)
-        speed_top.addStretch()
-        speed_layout.addLayout(speed_top)
 
+        speed_row.addWidget(QLabel("SPEED:"), 0)
+        speed_row.addWidget(self.speed_label, 0)
+        speed_row.addWidget(self.speed_combo, 0)
+        speed_row.addStretch()
+
+        # Add all control rows to a container
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setSpacing(6)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        info_row = QHBoxLayout()
+        info_row.addWidget(info_btn, 0)
+        info_row.addStretch()
+        controls_layout.addLayout(info_row)
+        controls_layout.addWidget(self.info_group)
+        controls_layout.addLayout(trim_row)
+
+        # Speed slider (separate from row for better visibility)
         self.speed_slider = QSlider(Qt.Orientation.Horizontal)
         self.speed_slider.setRange(25, 800)
         self.speed_slider.setValue(100)
-        self.speed_slider.setFixedHeight(16)
+        self.speed_slider.setFixedHeight(14)
+        self.speed_slider.setStyleSheet("""
+            QSlider::groove:horizontal { background: #141420; border-radius: 4px; height: 4px; }
+            QSlider::handle:horizontal { background: #ffb340; border: none; width: 10px; margin: -3px 0; border-radius: 5px; }
+        """)
         self.speed_slider.valueChanged.connect(lambda v: self._set_speed(v / 100))
-        speed_layout.addWidget(self.speed_slider)
-        layout.addWidget(speed_group)
+        controls_layout.addLayout(speed_row)
+        controls_layout.addWidget(self.speed_slider)
 
-        # Blur list
-        blur_group = QGroupBox("BLUR REGIONS")
-        blur_layout = QVBoxLayout(blur_group)
-        blur_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(controls)
+        layout.addSpacing(4)
 
-        hint = QLabel("Draw blur: enable Draw Blur, then drag on video.\nAdjust timing in the list below.")
-        hint.setStyleSheet("color: #444; font: 9px 'SF Pro Text'; padding: 4px 8px;")
-        hint.setWordWrap(True)
-        blur_layout.addWidget(hint)
+        # ─── Main Blur Panel (takes most space) ────────────────────────────────
+
+        blur_label = QLabel("BLUR REGIONS")
+        blur_label.setStyleSheet("color: #666; font: 9px 'SF Mono'; letter-spacing: 1px; font-weight: bold;")
+        layout.addWidget(blur_label)
+
+        hint = QLabel("✎ Draw on video, adjust timing below")
+        hint.setStyleSheet("color: #444; font: 8px 'SF Pro Text';")
+        layout.addWidget(hint)
 
         self.blur_panel = BlurPanel()
         self.blur_panel.region_selected.connect(self._on_blur_selected)
         self.blur_panel.region_removed.connect(self._remove_blur)
         self.blur_panel.region_updated.connect(self._refresh_canvas)
-        blur_layout.addWidget(self.blur_panel)
-        layout.addWidget(blur_group, stretch=1)
+        layout.addWidget(self.blur_panel, stretch=1)
 
-        # Export settings
-        exp_group = QGroupBox("EXPORT")
-        exp_layout = QGridLayout(exp_group)
+        # ─── Export (fixed at bottom) ──────────────────────────────────────────
 
-        exp_layout.addWidget(QLabel("Quality:"), 0, 0)
+        exp_row = QHBoxLayout()
+        exp_row.setSpacing(6)
+        exp_row.setContentsMargins(0, 0, 0, 0)
+
+        exp_row.addWidget(QLabel("Quality:"), 0)
         self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["High (CRF 18)", "Medium (CRF 23)", "Low (CRF 28)"])
-        exp_layout.addWidget(self.quality_combo, 0, 1)
+        self.quality_combo.addItems(["High", "Medium", "Low"])
+        self.quality_combo.setCurrentText("Medium")
+        self.quality_combo.setFixedHeight(28)
+        self.quality_combo.setStyleSheet("""
+            QComboBox {
+                background: #141420; color: #ccc; border: 1px solid #2a2a3a;
+                border-radius: 4px; padding: 2px 6px; font: 8px 'SF Mono';
+            }
+        """)
+        exp_row.addWidget(self.quality_combo, 0)
+        exp_row.addStretch()
 
-        layout.addWidget(exp_group)
+        layout.addSpacing(4)
+        layout.addLayout(exp_row)
 
         return panel
 
@@ -1458,8 +1486,8 @@ class ScreenCut(QMainWindow):
             return
 
         # CRF from combo
-        crf_map = {"High (CRF 18)": 18, "Medium (CRF 23)": 23, "Low (CRF 28)": 28}
-        crf = crf_map.get(self.quality_combo.currentText(), 18)
+        crf_map = {"High": 18, "Medium": 23, "Low": 28}
+        crf = crf_map.get(self.quality_combo.currentText(), 23)
 
         self.progress_dlg = QProgressDialog("Preparing…", "Cancel", 0, 100, self)
         self.progress_dlg.setWindowTitle("Exporting…")
