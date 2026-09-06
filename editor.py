@@ -1,1564 +1,542 @@
 #!/usr/bin/env python3
-"""
-ScreenCut — macOS Screen Recording Editor
-Features: Trim, Blur regions (time-ranged), Speed control, Export
-"""
+"""ScreenCut desktop entry point and editor workflow controller."""
 
 import sys
 import os
-import json
-import subprocess
-import tempfile
-import threading
-import time
-import math
+import copy
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Tuple
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QSlider, QFileDialog, QScrollArea,
-    QFrame, QSizePolicy, QSpinBox, QDoubleSpinBox, QMessageBox,
-    QProgressDialog, QGroupBox, QGridLayout, QSplitter, QToolButton,
-    QStatusBar, QComboBox, QDialog, QDialogButtonBox, QCheckBox
-)
-from PyQt6.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QRect, QPoint, QSize,
-    QRectF, QPointF, QMimeData, pyqtSlot
-)
-from PyQt6.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont, QPixmap, QImage,
-    QFontDatabase, QPalette, QLinearGradient, QKeySequence,
-    QShortcut, QIcon, QCursor, QDrag
-)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPixmap
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMainWindow, QMessageBox, QProgressDialog
 
-# ─── Data Models ──────────────────────────────────────────────────────────────
+from screencut.models import EditSession, validate_session
+from screencut.projects import SessionHistory, load_project, save_project
+from screencut.media import ExportWorker, ThumbnailWorker, PreviewController, ProbeWorker
+from screencut.ui import EditorUIMixin
 
-@dataclass
-class BlurRegion:
-    id: int
-    x: float          # 0.0–1.0 (normalized)
-    y: float
-    w: float
-    h: float
-    start_time: float  # seconds
-    end_time: float
-    label: str = ""
 
-    def to_ffmpeg_filter(self, video_w: int, video_h: int, idx: int) -> str:
-        px = int(self.x * video_w)
-        py = int(self.y * video_h)
-        pw = int(self.w * video_w)
-        ph = int(self.h * video_h)
-        # Make dimensions even for boxblur
-        pw = max(pw, 2)
-        ph = max(ph, 2)
-        tag_in = f"[blur_in_{idx}]" if idx > 0 else "[0:v]"
-        tag_out = f"[blur_out_{idx}]"
-        return (
-            f"{tag_in}split=2[base_{idx}][over_{idx}];"
-            f"[over_{idx}]crop={pw}:{ph}:{px}:{py},"
-            f"boxblur=20:5[blurred_{idx}];"
-            f"[base_{idx}][blurred_{idx}]overlay={px}:{py}"
-            f":enable='between(t,{self.start_time},{self.end_time})'{tag_out}"
-        )
-
-@dataclass
-class TrimRange:
-    start: float = 0.0
-    end: float = 0.0   # 0 means use full duration
-
-@dataclass
-class EditSession:
-    video_path: str = ""
-    duration: float = 0.0
-    width: int = 0
-    height: int = 0
-    fps: float = 30.0
-    trim: TrimRange = field(default_factory=TrimRange)
-    speed: float = 1.0
-    blur_regions: List[BlurRegion] = field(default_factory=list)
-    _next_blur_id: int = 0
-
-    def add_blur(self, x, y, w, h, start, end) -> BlurRegion:
-        b = BlurRegion(self._next_blur_id, x, y, w, h, start, end)
-        self._next_blur_id += 1
-        self.blur_regions.append(b)
-        return b
-
-    def remove_blur(self, bid: int):
-        self.blur_regions = [b for b in self.blur_regions if b.id != bid]
-
-    def effective_duration(self) -> float:
-        end = self.trim.end if self.trim.end > 0 else self.duration
-        raw = end - self.trim.start
-        return raw / self.speed if self.speed > 0 else raw
-
-# ─── FFmpeg Worker ────────────────────────────────────────────────────────────
-
-class ExportWorker(QThread):
-    progress = pyqtSignal(int, str)
-    finished = pyqtSignal(bool, str)
-
-    def __init__(self, session: EditSession, output_path: str):
-        super().__init__()
-        self.session = session
-        self.output_path = output_path
-
-    def run(self):
-        try:
-            self.progress.emit(5, "Preparing export…")
-            s = self.session
-            vw, vh = s.width, s.height
-
-            trim_start = s.trim.start
-            trim_end = s.trim.end if s.trim.end > 0 else s.duration
-            trim_dur = trim_end - trim_start
-            duration_out = trim_dur / max(s.speed, 0.01)
-
-            # ── Video filter chain ──────────────────────────────────────────
-            # Strategy: trim → reset PTS → speed → chain blur regions
-            # Each blur uses crop+boxblur+overlay (no split needed — overlay
-            # with enable only activates during the time window).
-            # We keep a running label [vN] flowing through each blur step.
-
-            pts_factor = 1.0 / s.speed
-
-            # Step 1: trim the raw stream and reset PTS to 0
-            # setpts=PTS-STARTPTS resets after trim; then scale PTS for speed
-            v_chain = (
-                f"[0:v]trim=start={trim_start:.6f}:duration={trim_dur:.6f},"
-                f"setpts={pts_factor:.8f}*(PTS-STARTPTS)[v_base]"
-            )
-
-            filter_parts = [v_chain]
-            prev_label = "[v_base]"
-
-            for i, br in enumerate(s.blur_regions):
-                # Times relative to trim start, then adjusted for speed
-                t0 = max(0.0, (br.start_time - trim_start)) / s.speed
-                t1 = max(0.0, (br.end_time   - trim_start)) / s.speed
-                t1 = min(t1, duration_out)
-
-                if t1 <= t0:
-                    continue  # skip degenerate regions
-
-                # Pixel coords — ensure positive and within frame
-                px = max(0, int(br.x * vw))
-                py = max(0, int(br.y * vh))
-                pw = max(4, int(br.w * vw))
-                ph = max(4, int(br.h * vh))
-                # Clamp to frame bounds
-                pw = min(pw, vw - px)
-                ph = min(ph, vh - py)
-                # Make even (required by libx264 subsampling)
-                pw = max(2, pw - (pw % 2))
-                ph = max(2, ph - (ph % 2))
-
-                out_label = f"[v{i}]"
-
-                # Approach: crop the region → apply gaussian blur → overlay back
-                # The overlay enable expression gates it to [t0, t1]
-                blur_part = (
-                    f"{prev_label}split=2[pass{i}][crop_in{i}];"
-                    f"[crop_in{i}]crop={pw}:{ph}:{px}:{py},"
-                    f"gblur=sigma=20[blurred{i}];"
-                    f"[pass{i}][blurred{i}]overlay={px}:{py}"
-                    f":enable='between(t,{t0:.6f},{t1:.6f})'{out_label}"
-                )
-                filter_parts.append(blur_part)
-                prev_label = out_label
-
-            # Rename final label to [vout]
-            if prev_label == "[v_base]":
-                # No blurs — just rename
-                filter_parts[0] = filter_parts[0].replace("[v_base]", "[vout]")
-            else:
-                # Replace last label with [vout]
-                filter_parts[-1] = filter_parts[-1].rsplit(prev_label, 1)[0] + "[vout]"
-
-            # ── Audio filter chain ──────────────────────────────────────────
-            # atempo range is 0.5–2.0; chain multiple for speeds outside range
-            speed = s.speed
-            atempo_filters = []
-            if speed < 0.5:
-                # chain downward: each step halves at 0.5 minimum
-                tmp = speed
-                while tmp < 0.5:
-                    atempo_filters.append("atempo=0.5")
-                    tmp /= 0.5
-                atempo_filters.append(f"atempo={tmp:.6f}")
-            elif speed > 2.0:
-                tmp = speed
-                while tmp > 2.0:
-                    atempo_filters.append("atempo=2.0")
-                    tmp /= 2.0
-                atempo_filters.append(f"atempo={tmp:.6f}")
-            else:
-                atempo_filters.append(f"atempo={speed:.6f}")
-
-            has_audio = getattr(self, 'has_audio', True)
-            if has_audio:
-                a_chain = (
-                    f"[0:a]atrim=start={trim_start:.6f}:duration={trim_dur:.6f},"
-                    f"asetpts=PTS-STARTPTS,"
-                    + ",".join(atempo_filters) +
-                    "[aout]"
-                )
-                filter_parts.append(a_chain)
-
-            full_filter = ";".join(filter_parts)
-
-            self.progress.emit(15, "Building filter graph…")
-
-            # Print filter for debugging
-            print("=== Export Settings ===")
-            print(f"Speed: {s.speed}x")
-            print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s")
-            print("=== FFmpeg filter_complex ===")
-            print(full_filter)
-            print("=============================")
-
-            crf = getattr(self, 'crf', 18)
-
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", s.video_path,
-                "-filter_complex", full_filter,
-                "-map", "[vout]",
-            ]
-            if has_audio:
-                cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
-            else:
-                cmd += ["-an"]
-            cmd += [
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", str(crf),
-                "-movflags", "+faststart",
-                self.output_path
-            ]
-
-            self.progress.emit(20, "Running FFmpeg…")
-
-            proc = subprocess.Popen(
-                cmd,
-                stderr=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                text=True,
-                bufsize=1
-            )
-
-            stderr_lines = []
-            for line in proc.stderr:
-                stderr_lines.append(line)
-                if "time=" in line:
-                    try:
-                        t_str = line.split("time=")[1].split(" ")[0]
-                        parts = t_str.split(":")
-                        t_sec = float(parts[0])*3600 + float(parts[1])*60 + float(parts[2])
-                        pct = min(95, int(20 + 75 * (t_sec / max(duration_out, 0.1))))
-                        self.progress.emit(pct, f"Encoding… {t_sec:.1f}s / {duration_out:.1f}s")
-                    except:
-                        pass
-
-            proc.wait()
-            if proc.returncode == 0:
-                self.progress.emit(100, "Done!")
-                self.finished.emit(True, self.output_path)
-            else:
-                # Surface the actual ffmpeg error message
-                error_lines = [l for l in stderr_lines if "Error" in l or "Invalid" in l or "error" in l]
-                error_msg = "\n".join(error_lines[-5:]) if error_lines else "\n".join(stderr_lines[-8:])
-                print("=== FFmpeg stderr ===")
-                print("".join(stderr_lines[-20:]))
-                print("====================")
-                self.finished.emit(False, f"FFmpeg error (code {proc.returncode}):\n{error_msg}")
-        except Exception as e:
-            import traceback
-            self.finished.emit(False, f"{e}\n{traceback.format_exc()}")
-
-
-class ThumbnailWorker(QThread):
-    ready = pyqtSignal(list)  # list of (time, QPixmap)
-
-    def __init__(self, video_path: str, duration: float, count: int = 20):
-        super().__init__()
-        self.video_path = video_path
-        self.duration = duration
-        self.count = count
-
-    def run(self):
-        results = []
-        step = self.duration / self.count
-        for i in range(self.count):
-            t = i * step
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                    tmp = f.name
-                cmd = [
-                    "ffmpeg", "-y", "-ss", str(t),
-                    "-i", self.video_path,
-                    "-vframes", "1",
-                    "-vf", "scale=120:-1",
-                    tmp
-                ]
-                subprocess.run(cmd, capture_output=True, timeout=5)
-                pix = QPixmap(tmp)
-                if not pix.isNull():
-                    results.append((t, pix))
-                os.unlink(tmp)
-            except:
-                pass
-        self.ready.emit(results)
-
-
-# ─── Video Preview Widget ─────────────────────────────────────────────────────
-
-class VideoCanvas(QWidget):
-    """Displays video frame + overlay for drawing blur regions."""
-    blur_added = pyqtSignal(float, float, float, float)  # x,y,w,h normalized
-
-    def __init__(self):
-        super().__init__()
-        self.frame_pixmap: Optional[QPixmap] = None
-        self.blur_regions: List[BlurRegion] = []
-        self.current_time: float = 0.0
-        self.selected_blur_id: Optional[int] = None
-        self.draw_mode = False  # True = drawing new blur
-        self._drag_start: Optional[QPoint] = None
-        self._drag_rect: Optional[QRect] = None
-        self.video_rect = QRect()
-        self.setMinimumSize(640, 360)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMouseTracking(True)
-
-    def set_frame(self, pixmap: QPixmap):
-        self.frame_pixmap = pixmap
-        self.update()
-
-    def set_blurs(self, blurs: List[BlurRegion]):
-        self.blur_regions = blurs
-        self.update()
-
-    def _compute_video_rect(self) -> QRect:
-        if not self.frame_pixmap:
-            return QRect()
-        w, h = self.width(), self.height()
-        vw, vh = self.frame_pixmap.width(), self.frame_pixmap.height()
-        scale = min(w / vw, h / vh)
-        sw, sh = int(vw * scale), int(vh * scale)
-        ox, oy = (w - sw) // 2, (h - sh) // 2
-        return QRect(ox, oy, sw, sh)
-
-    def _to_normalized(self, screen_pt: QPoint) -> Tuple[float, float]:
-        r = self.video_rect
-        if r.isEmpty():
-            return (0, 0)
-        nx = (screen_pt.x() - r.x()) / r.width()
-        ny = (screen_pt.y() - r.y()) / r.height()
-        return (max(0, min(1, nx)), max(0, min(1, ny)))
-
-    def _to_screen(self, nx: float, ny: float) -> QPoint:
-        r = self.video_rect
-        return QPoint(int(r.x() + nx * r.width()), int(r.y() + ny * r.height()))
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # Background
-        p.fillRect(self.rect(), QColor("#0a0a0f"))
-
-        if self.frame_pixmap:
-            self.video_rect = self._compute_video_rect()
-            p.drawPixmap(self.video_rect, self.frame_pixmap)
-
-            # Draw blur overlays
-            for br in self.blur_regions:
-                if not (br.start_time <= self.current_time <= br.end_time):
-                    continue
-                x1 = self._to_screen(br.x, br.y)
-                x2 = self._to_screen(br.x + br.w, br.y + br.h)
-                rect = QRect(x1, x2)
-                is_sel = (br.id == self.selected_blur_id)
-
-                # Semi-transparent fill to indicate blur
-                color = QColor(0, 120, 255, 60) if is_sel else QColor(255, 200, 0, 40)
-                p.fillRect(rect, color)
-
-                # Border
-                pen = QPen(QColor(0, 180, 255) if is_sel else QColor(255, 200, 0), 2)
-                pen.setStyle(Qt.PenStyle.DashLine if not is_sel else Qt.PenStyle.SolidLine)
-                p.setPen(pen)
-                p.drawRect(rect)
-
-                # Label
-                p.setPen(QPen(QColor(255, 255, 255, 200)))
-                f = QFont("SF Mono", 9)
-                f.setBold(True)
-                p.setFont(f)
-                label = br.label or f"Blur #{br.id+1}"
-                p.drawText(rect.adjusted(4, 3, 0, 0), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, label)
-
-            # Active drawing rect
-            if self._drag_rect and self.draw_mode:
-                p.fillRect(self._drag_rect, QColor(0, 200, 100, 50))
-                pen = QPen(QColor(0, 255, 100), 2)
-                pen.setStyle(Qt.PenStyle.DashLine)
-                p.setPen(pen)
-                p.drawRect(self._drag_rect)
-
-        else:
-            # Empty state
-            p.setPen(QPen(QColor("#333")))
-            p.drawRect(self.rect().adjusted(1,1,-1,-1))
-            p.setPen(QPen(QColor("#555")))
-            f = QFont("SF Pro Display", 16)
-            p.setFont(f)
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drop a video file or click Open")
-
-    def mousePressEvent(self, event):
-        if not self.frame_pixmap or event.button() != Qt.MouseButton.LeftButton:
-            return
-        if self.draw_mode:
-            self._drag_start = event.pos()
-            self._drag_rect = None
-        else:
-            # Select blur
-            nx, ny = self._to_normalized(event.pos())
-            for br in reversed(self.blur_regions):
-                if (br.start_time <= self.current_time <= br.end_time and
-                        br.x <= nx <= br.x + br.w and
-                        br.y <= ny <= br.y + br.h):
-                    self.selected_blur_id = br.id
-                    self.update()
-                    return
-            self.selected_blur_id = None
-            self.update()
-
-    def mouseMoveEvent(self, event):
-        if self.draw_mode and self._drag_start:
-            p = event.pos()
-            self._drag_rect = QRect(self._drag_start, p).normalized()
-            self.update()
-
-    def mouseReleaseEvent(self, event):
-        if self.draw_mode and self._drag_start and self._drag_rect:
-            r = self._drag_rect
-            if r.width() > 10 and r.height() > 10:
-                nx, ny = self._to_normalized(r.topLeft())
-                nw = r.width() / self.video_rect.width()
-                nh = r.height() / self.video_rect.height()
-                self.blur_added.emit(nx, ny, nw, nh)
-            self._drag_start = None
-            self._drag_rect = None
-            self.update()
-
-
-# ─── Timeline Widget ──────────────────────────────────────────────────────────
-
-class Timeline(QWidget):
-    seek = pyqtSignal(float)
-    trim_changed = pyqtSignal(float, float)
-
-    def __init__(self):
-        super().__init__()
-        self.duration: float = 0.0
-        self.current_time: float = 0.0
-        self.trim_start: float = 0.0
-        self.trim_end: float = 0.0
-        self.blur_regions: List[BlurRegion] = []
-        self.thumbnails: List[Tuple[float, QPixmap]] = []
-        self._drag = None  # 'playhead' | 'trim_start' | 'trim_end'
-        self.setMinimumHeight(90)
-        self.setMaximumHeight(110)
-        self.setMouseTracking(True)
-
-    THUMB_H = 50
-    RULER_H = 18
-    MARGIN = 12
-
-    def _t_to_x(self, t: float) -> int:
-        if self.duration <= 0:
-            return self.MARGIN
-        w = self.width() - 2 * self.MARGIN
-        return int(self.MARGIN + (t / self.duration) * w)
-
-    def _x_to_t(self, x: int) -> float:
-        if self.duration <= 0:
-            return 0
-        w = self.width() - 2 * self.MARGIN
-        t = (x - self.MARGIN) / w * self.duration
-        return max(0, min(self.duration, t))
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        W, H = self.width(), self.height()
-        p.fillRect(self.rect(), QColor("#0d0d15"))
-
-        if self.duration <= 0:
-            p.setPen(QPen(QColor("#444")))
-            p.setFont(QFont("SF Pro Text", 11))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Load a video to see timeline")
-            return
-
-        M = self.MARGIN
-        TH = self.THUMB_H
-        RH = self.RULER_H
-
-        # Thumbnail strip background
-        strip_rect = QRect(M, 0, W - 2*M, TH)
-        p.fillRect(strip_rect, QColor("#1a1a28"))
-
-        # Draw thumbnails
-        for t, pix in self.thumbnails:
-            x = self._t_to_x(t)
-            scaled = pix.scaledToHeight(TH, Qt.TransformationMode.SmoothTransformation)
-            p.drawPixmap(x, 0, scaled)
-
-        # Dimmed area outside trim
-        trim_end = self.trim_end if self.trim_end > 0 else self.duration
-        tx_s = self._t_to_x(self.trim_start)
-        tx_e = self._t_to_x(trim_end)
-        p.fillRect(QRect(M, 0, tx_s - M, TH), QColor(0, 0, 0, 150))
-        p.fillRect(QRect(tx_e, 0, W - M - tx_e, TH), QColor(0, 0, 0, 150))
-
-        # Trim handles
-        pen = QPen(QColor("#00d4ff"), 2)
-        p.setPen(pen)
-        p.drawLine(tx_s, 0, tx_s, TH)
-        p.drawLine(tx_e, 0, tx_e, TH)
-        # Handle caps
-        p.setBrush(QBrush(QColor("#00d4ff")))
-        p.drawRect(QRect(tx_s - 5, 0, 10, 16))
-        p.drawRect(QRect(tx_e - 5, 0, 10, 16))
-
-        # Blur bands under ruler
-        ruler_y = TH + 2
-        for br in self.blur_regions:
-            bx_s = self._t_to_x(br.start_time)
-            bx_e = self._t_to_x(br.end_time)
-            p.fillRect(QRect(bx_s, ruler_y, bx_e - bx_s, RH - 4), QColor(255, 200, 0, 160))
-            p.setPen(QPen(QColor(255, 220, 50)))
-            p.setFont(QFont("SF Mono", 7))
-            label = br.label or f"B{br.id+1}"
-            p.drawText(QRect(bx_s+2, ruler_y, bx_e - bx_s - 4, RH - 4),
-                       Qt.AlignmentFlag.AlignVCenter, label)
-
-        # Ruler ticks
-        p.setPen(QPen(QColor("#555")))
-        p.setFont(QFont("SF Mono", 8))
-        step = max(1, int(self.duration / 10))
-        for sec in range(0, int(self.duration) + 1, step):
-            tx = self._t_to_x(sec)
-            p.drawLine(tx, TH, tx, TH + RH)
-            mins = sec // 60
-            secs = sec % 60
-            label = f"{mins}:{secs:02d}"
-            p.drawText(tx + 2, TH + RH - 2, label)
-
-        # Playhead
-        cx = self._t_to_x(self.current_time)
-        p.setPen(QPen(QColor("#ff4466"), 2))
-        p.drawLine(cx, 0, cx, H)
-        # Playhead diamond
-        p.setBrush(QBrush(QColor("#ff4466")))
-        p.setPen(Qt.PenStyle.NoPen)
-        diamond = [QPoint(cx, 0), QPoint(cx+6, 8), QPoint(cx, 16), QPoint(cx-6, 8)]
-        from PyQt6.QtGui import QPolygon
-        p.drawPolygon(QPolygon(diamond))
-
-    def mousePressEvent(self, event):
-        if self.duration <= 0:
-            return
-        x = event.pos().x()
-        trim_end = self.trim_end if self.trim_end > 0 else self.duration
-        tx_s = self._t_to_x(self.trim_start)
-        tx_e = self._t_to_x(trim_end)
-        cx = self._t_to_x(self.current_time)
-
-        if abs(x - tx_s) < 10:
-            self._drag = 'trim_start'
-        elif abs(x - tx_e) < 10:
-            self._drag = 'trim_end'
-        elif abs(x - cx) < 8:
-            self._drag = 'playhead'
-        else:
-            self._drag = 'playhead'
-            t = self._x_to_t(x)
-            self.current_time = t
-            self.seek.emit(t)
-            self.update()
-
-    def mouseMoveEvent(self, event):
-        if not self._drag or self.duration <= 0:
-            return
-        t = self._x_to_t(event.pos().x())
-        trim_end = self.trim_end if self.trim_end > 0 else self.duration
-        if self._drag == 'playhead':
-            self.current_time = t
-            self.seek.emit(t)
-        elif self._drag == 'trim_start':
-            self.trim_start = max(0, min(t, trim_end - 0.5))
-            self.trim_changed.emit(self.trim_start, self.trim_end)
-        elif self._drag == 'trim_end':
-            self.trim_end = max(self.trim_start + 0.5, min(t, self.duration))
-            self.trim_changed.emit(self.trim_start, self.trim_end)
-        self.update()
-
-    def mouseReleaseEvent(self, event):
-        self._drag = None
-
-
-# ─── Blur Panel ───────────────────────────────────────────────────────────────
-
-class BlurPanel(QWidget):
-    region_selected = pyqtSignal(int)
-    region_removed = pyqtSignal(int)
-    region_updated = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self.session: Optional[EditSession] = None
-        self._setup_ui()
-
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-
-        title = QLabel("BLUR REGIONS")
-        title.setStyleSheet("color: #888; font: 9px 'SF Mono'; letter-spacing: 2px;")
-        layout.addWidget(title)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll.setStyleSheet("background: transparent;")
-        layout.addWidget(self.scroll)
-
-        self.container = QWidget()
-        self.container.setStyleSheet("background: transparent;")
-        self.vbox = QVBoxLayout(self.container)
-        self.vbox.setSpacing(4)
-        self.vbox.addStretch()
-        self.scroll.setWidget(self.container)
-
-    def refresh(self, session: EditSession, current_time: float):
-        self.session = session
-        # Clear
-        while self.vbox.count() > 1:
-            item = self.vbox.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        for br in session.blur_regions:
-            card = self._make_card(br, session.duration, current_time)
-            self.vbox.insertWidget(self.vbox.count() - 1, card)
-
-    def _make_card(self, br: BlurRegion, duration: float, current_time: float) -> QWidget:
-        card = QFrame()
-        card.setObjectName(f"blur_card_{br.id}")
-        active = br.start_time <= current_time <= br.end_time
-        card.setStyleSheet(f"""
-            QFrame {{
-                background: {'#1a2535' if active else '#141420'};
-                border: 1px solid {'#00d4ff' if active else '#2a2a3a'};
-                border-radius: 6px;
-                padding: 4px;
-            }}
-        """)
-
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(4)
-
-        # Header
-        hdr = QHBoxLayout()
-        lbl = QLabel(br.label or f"Blur #{br.id + 1}")
-        lbl.setStyleSheet("color: #eee; font: bold 11px 'SF Pro Text';")
-        hdr.addWidget(lbl)
-
-        if active:
-            dot = QLabel("●")
-            dot.setStyleSheet("color: #00d4ff; font-size: 8px;")
-            hdr.addWidget(dot)
-        hdr.addStretch()
-
-        del_btn = QToolButton()
-        del_btn.setText("✕")
-        del_btn.setStyleSheet("""
-            QToolButton { color: #ff4466; background: transparent; border: none; font: 13px; }
-            QToolButton:hover { color: #ff6688; }
-        """)
-        del_btn.clicked.connect(lambda _, bid=br.id: self.region_removed.emit(bid))
-        hdr.addWidget(del_btn)
-        layout.addLayout(hdr)
-
-        # Time range (compact 2-row layout)
-        time_layout = QGridLayout()
-        time_layout.setSpacing(4)
-        time_layout.setContentsMargins(0, 0, 0, 0)
-
-        def make_spin(val, max_val, attr, region):
-            sp = QDoubleSpinBox()
-            sp.setRange(0, max_val)
-            sp.setSingleStep(0.1)
-            sp.setDecimals(2)
-            sp.setValue(val)
-            sp.setSuffix("s")
-            sp.setStyleSheet("""
-                QDoubleSpinBox {
-                    background: #0d0d18; color: #eee;
-                    border: 1px solid #333; border-radius: 3px;
-                    padding: 3px 4px; font: 10px 'SF Mono'; font-weight: bold;
-                    min-height: 22px;
-                }
-                QDoubleSpinBox::up-button {
-                    subcontrol-origin: border;
-                    subcontrol-position: right top;
-                    width: 16px; height: 11px;
-                    border: none; background: #1a1a28;
-                }
-                QDoubleSpinBox::down-button {
-                    subcontrol-origin: border;
-                    subcontrol-position: right bottom;
-                    width: 16px; height: 11px;
-                    border: none; background: #1a1a28;
-                }
-            """)
-            sp.setMaximumWidth(75)
-            sp.setCursor(Qt.CursorShape.ArrowCursor)
-
-            def on_change(v, a=attr, r=region):
-                setattr(r, a, v)
-                self.region_updated.emit()
-            sp.valueChanged.connect(on_change)
-
-            # Support Shift+scroll for faster adjustment
-            original_wheelEvent = sp.wheelEvent
-            def wheel_event(event, orig=original_wheelEvent):
-                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                    sp.setSingleStep(1.0)
-                    orig(event)
-                    sp.setSingleStep(0.1)
-                else:
-                    orig(event)
-            sp.wheelEvent = wheel_event
-
-            return sp
-
-        # Row 1: START
-        start_spin = make_spin(br.start_time, duration, 'start_time', br)
-        time_layout.addWidget(QLabel("<span style='color:#666;font:8px SF Mono'>START</span>"), 0, 0)
-        time_layout.addWidget(start_spin, 0, 1)
-
-        # Quick buttons for START (compact)
-        start_btn_layout = QHBoxLayout()
-        start_btn_layout.setSpacing(2)
-        start_btn_layout.setContentsMargins(0, 0, 0, 0)
-        for label, delta in [("−", -0.1), ("+", +0.1)]:
-            btn = QPushButton(label)
-            btn.setFixedSize(24, 22)
-            btn.setStyleSheet("""
-                QPushButton { background: #1a1a28; color: #666; border: 1px solid #2a2a3a;
-                            border-radius: 2px; font: 8px 'SF Mono'; padding: 0px; font-weight: bold; }
-                QPushButton:hover { background: #252538; color: #aaa; }
-            """)
-            btn.clicked.connect(lambda _, d=delta: start_spin.setValue(max(0, start_spin.value() + d)))
-            start_btn_layout.addWidget(btn)
-        time_layout.addLayout(start_btn_layout, 0, 2)
-
-        # Row 2: END
-        end_spin = make_spin(br.end_time, duration, 'end_time', br)
-        time_layout.addWidget(QLabel("<span style='color:#666;font:8px SF Mono'>END</span>"), 1, 0)
-        time_layout.addWidget(end_spin, 1, 1)
-
-        # Quick buttons for END (compact)
-        end_btn_layout = QHBoxLayout()
-        end_btn_layout.setSpacing(2)
-        end_btn_layout.setContentsMargins(0, 0, 0, 0)
-        for label, delta in [("−", -0.1), ("+", +0.1)]:
-            btn = QPushButton(label)
-            btn.setFixedSize(24, 22)
-            btn.setStyleSheet("""
-                QPushButton { background: #1a1a28; color: #666; border: 1px solid #2a2a3a;
-                            border-radius: 2px; font: 8px 'SF Mono'; padding: 0px; font-weight: bold; }
-                QPushButton:hover { background: #252538; color: #aaa; }
-            """)
-            btn.clicked.connect(lambda _, d=delta: end_spin.setValue(min(duration, end_spin.value() + d)))
-            end_btn_layout.addWidget(btn)
-        time_layout.addLayout(end_btn_layout, 1, 2)
-
-        layout.addLayout(time_layout)
-
-        # Pos info
-        pos_lbl = QLabel(
-            f"<span style='color:#555;font:9px SF Mono'>"
-            f"x:{br.x:.2f} y:{br.y:.2f} w:{br.w:.2f} h:{br.h:.2f}"
-            f"</span>"
-        )
-        pos_lbl.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(pos_lbl)
-
-        card.mousePressEvent = lambda e, bid=br.id: self.region_selected.emit(bid)
-        return card
-
-
-# ─── Main Window ──────────────────────────────────────────────────────────────
-
-class ScreenCut(QMainWindow):
+class ScreenCut(EditorUIMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.session = EditSession()
+        self.history = SessionHistory(self.session)
+        self.project_path = None
+        self._saved_session = None
+        self._restoring = False
         self.playing = False
-        self._playback_timer = QTimer()
-        self._playback_timer.setInterval(33)  # ~30fps
-        self._playback_timer.timeout.connect(self._advance_playback)
-        self._frame_cache = {}
-        self._thumb_worker: Optional[ThumbnailWorker] = None
-        self._export_worker: Optional[ExportWorker] = None
+        self._generation = 0
+        self._workers = []
+        self._thumb_worker = None
+        self._export_worker = None
+        self._probe_worker = None
         self._setup_style()
         self._setup_ui()
+        self.setAcceptDrops(True)
         self._setup_shortcuts()
+        self.preview = PreviewController(self)
+        self.preview.frame_ready.connect(self._on_frame)
+        self.preview.position_changed.connect(self._on_position)
+        self.preview.playback_changed.connect(self._on_playback)
+        self.preview.error.connect(lambda message: self.status.showMessage(message, 10000))
+        self._update_history_ui()
 
-    def _setup_style(self):
-        self.setStyleSheet("""
-            QMainWindow { background: #08080f; }
-            QWidget { background: #08080f; color: #ddd; font-family: 'SF Pro Text', system-ui; }
-            QPushButton {
-                background: #1c1c2e; color: #ccc;
-                border: 1px solid #2a2a40; border-radius: 6px;
-                padding: 6px 14px; font-size: 12px;
-            }
-            QPushButton:hover { background: #252538; border-color: #3a3a55; }
-            QPushButton:pressed { background: #141422; }
-            QPushButton:disabled { color: #444; border-color: #1a1a28; }
-            QPushButton#primary {
-                background: #0066ff; color: white;
-                border: 1px solid #0055dd;
-            }
-            QPushButton#primary:hover { background: #0077ff; }
-            QPushButton#danger {
-                background: #2d1018; color: #ff4466;
-                border: 1px solid #3d1828;
-            }
-            QPushButton#danger:hover { background: #3d1828; }
-            QPushButton#accent {
-                background: #002a1a; color: #00d4aa;
-                border: 1px solid #004030;
-            }
-            QPushButton#accent:hover { background: #003320; }
-            QLabel { color: #bbb; background: transparent; }
-            QGroupBox {
-                border: 1px solid #1e1e30; border-radius: 8px;
-                margin-top: 10px; padding-top: 8px;
-                font-size: 10px; color: #555;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; subcontrol-position: top left;
-                left: 10px; color: #555; letter-spacing: 1.5px;
-            }
-            QSlider::groove:horizontal {
-                background: #1a1a2a; height: 4px; border-radius: 2px;
-            }
-            QSlider::handle:horizontal {
-                background: #00d4ff; width: 14px; height: 14px;
-                border-radius: 7px; margin: -5px 0;
-            }
-            QSlider::sub-page:horizontal { background: #00d4ff; border-radius: 2px; }
-            QDoubleSpinBox, QSpinBox, QComboBox {
-                background: #0d0d18; color: #ccc;
-                border: 1px solid #2a2a3a; border-radius: 5px;
-                padding: 4px 8px;
-            }
-            QStatusBar { background: #050508; color: #555; font: 10px 'SF Mono'; }
-            QSplitter::handle { background: #1a1a28; }
-        """)
+    def _track_worker(self, worker):
+        self._workers = [job for job in self._workers if job.isRunning()]
+        self._workers.append(worker)
+        # QThread.finished can be shadowed by a worker's result signal.
+        # Keep references until shutdown so in-flight jobs cannot be destroyed.
+        return worker
 
-    def _setup_ui(self):
-        self.setWindowTitle("ScreenCut — Screen Recording Editor")
-        self.resize(1280, 820)
-        self.setMinimumSize(960, 640)
-
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        # Top toolbar
-        root.addWidget(self._build_toolbar())
-
-        # Main split
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        root.addWidget(self.splitter, stretch=1)
-
-        # Left: canvas + timeline
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(10, 10, 10, 10)
-        left_layout.setSpacing(8)
-
-        self.canvas = VideoCanvas()
-        self.canvas.blur_added.connect(self._on_blur_drawn)
-        left_layout.addWidget(self.canvas, stretch=1)
-
-        # Playback controls
-        left_layout.addWidget(self._build_playback_controls())
-
-        # Timeline
-        self.timeline = Timeline()
-        self.timeline.seek.connect(self._on_seek)
-        self.timeline.trim_changed.connect(self._on_trim_changed)
-        left_layout.addWidget(self.timeline)
-
-        # Time display
-        self.time_label = QLabel("0:00.00  /  0:00.00")
-        self.time_label.setStyleSheet("color: #555; font: 11px 'SF Mono'; padding: 2px 0;")
-        left_layout.addWidget(self.time_label)
-
-        self.splitter.addWidget(left_panel)
-
-        # Right: controls
-        right_panel = self._build_right_panel()
-        right_panel.setFixedWidth(300)
-        self.splitter.addWidget(right_panel)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 0)
-
-        # Status bar
-        self.status = QStatusBar()
-        self.setStatusBar(self.status)
-        self.status.showMessage("Ready — open a screen recording to begin")
-
-    def _build_toolbar(self) -> QWidget:
-        bar = QFrame()
-        bar.setStyleSheet("background: #0d0d18; border-bottom: 1px solid #1a1a28;")
-        bar.setFixedHeight(52)
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(16, 8, 16, 8)
-        layout.setSpacing(10)
-
-        # Logo
-        logo = QLabel("✦ ScreenCut")
-        logo.setStyleSheet("color: #00d4ff; font: bold 17px 'SF Pro Display'; letter-spacing: -0.5px;")
-        layout.addWidget(logo)
-
-        layout.addStretch()
-
-        self.open_btn = QPushButton("⌘ Open Video")
-        self.open_btn.setObjectName("primary")
-        self.open_btn.setFixedHeight(34)
-        self.open_btn.clicked.connect(self._open_video)
-        layout.addWidget(self.open_btn)
-
-        self.blur_draw_btn = QPushButton("✥ Draw Blur")
-        self.blur_draw_btn.setCheckable(True)
-        self.blur_draw_btn.setFixedHeight(34)
-        self.blur_draw_btn.setStyleSheet("""
-            QPushButton { background: #0d1a10; color: #00cc88; border: 1px solid #1a3020; border-radius: 6px; padding: 6px 14px; }
-            QPushButton:checked { background: #00cc88; color: #000; border-color: #00cc88; }
-            QPushButton:hover:!checked { background: #122018; }
-        """)
-        self.blur_draw_btn.toggled.connect(self._toggle_draw_mode)
-        self.blur_draw_btn.setEnabled(False)
-        layout.addWidget(self.blur_draw_btn)
-
-        self.export_btn = QPushButton("⬇ Export")
-        self.export_btn.setObjectName("accent")
-        self.export_btn.setFixedHeight(34)
-        self.export_btn.clicked.connect(self._export)
-        self.export_btn.setEnabled(False)
-        layout.addWidget(self.export_btn)
-
-        return bar
-
-    def _build_playback_controls(self) -> QWidget:
-        w = QWidget()
-        layout = QHBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        btn_style = """
-            QPushButton {
-                background: #141420; color: #aaa;
-                border: 1px solid #222235; border-radius: 6px;
-                padding: 4px 10px; font-size: 15px; min-width: 36px;
-            }
-            QPushButton:hover { background: #1c1c2e; color: #eee; }
-            QPushButton:disabled { color: #333; }
-        """
-
-        self.prev_frame_btn = QPushButton("⏮")
-        self.prev_frame_btn.setStyleSheet(btn_style)
-        self.prev_frame_btn.clicked.connect(lambda: self._step_frame(-1))
-        self.prev_frame_btn.setEnabled(False)
-        layout.addWidget(self.prev_frame_btn)
-
-        self.play_btn = QPushButton("▶")
-        self.play_btn.setStyleSheet(btn_style + "QPushButton { font-size: 16px; min-width: 44px; }")
-        self.play_btn.clicked.connect(self._toggle_play)
-        self.play_btn.setEnabled(False)
-        layout.addWidget(self.play_btn)
-
-        self.next_frame_btn = QPushButton("⏭")
-        self.next_frame_btn.setStyleSheet(btn_style)
-        self.next_frame_btn.clicked.connect(lambda: self._step_frame(1))
-        self.next_frame_btn.setEnabled(False)
-        layout.addWidget(self.next_frame_btn)
-
-        layout.addSpacing(12)
-
-        # Set blur start/end at current time
-        self.mark_start_btn = QPushButton("[ Mark Start")
-        self.mark_start_btn.setStyleSheet(btn_style)
-        self.mark_start_btn.setEnabled(False)
-        self.mark_start_btn.clicked.connect(self._mark_blur_start)
-        layout.addWidget(self.mark_start_btn)
-
-        self.mark_end_btn = QPushButton("Mark End ]")
-        self.mark_end_btn.setStyleSheet(btn_style)
-        self.mark_end_btn.setEnabled(False)
-        self.mark_end_btn.clicked.connect(self._mark_blur_end)
-        layout.addWidget(self.mark_end_btn)
-
-        layout.addStretch()
-        return w
-
-    def _build_right_panel(self) -> QWidget:
-        panel = QWidget()
-        panel.setStyleSheet("background: #0b0b15; border-left: 1px solid #181828;")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        # ─── Compact Controls Section ──────────────────────────────────────────
-
-        # Video Info (collapsible, minimal space)
-        info_btn = QPushButton("ℹ")
-        info_btn.setCheckable(True)
-        info_btn.setFixedSize(28, 28)
-        info_btn.setStyleSheet("""
-            QPushButton {
-                background: #141420; color: #555; border: 1px solid #2a2a3a;
-                border-radius: 4px; font: 12px; padding: 0px;
-            }
-            QPushButton:hover { color: #888; background: #1a1a28; }
-            QPushButton:checked { background: #1a2535; color: #00d4ff; border-color: #00d4ff; }
-        """)
-        self.info_group = QGroupBox()
-        self.info_group.setVisible(False)
-        info_layout = QGridLayout(self.info_group)
-        info_layout.setSpacing(3)
-        info_layout.setContentsMargins(6, 6, 6, 6)
-        self.info_labels = {}
-        for i, (k, v) in enumerate([("File", "—"), ("Duration", "—")]):
-            lbl = QLabel(k + ":")
-            lbl.setStyleSheet("color: #555; font: 7px 'SF Mono'; letter-spacing: 0.5px;")
-            val = QLabel(v)
-            val.setStyleSheet("color: #999; font: 8px 'SF Mono';")
-            val.setWordWrap(True)
-            info_layout.addWidget(lbl, i, 0)
-            info_layout.addWidget(val, i, 1)
-            self.info_labels[k] = val
-        # Add remaining labels for compatibility
-        for k in ["Resolution", "FPS"]:
-            self.info_labels[k] = QLabel("—")
-        info_btn.toggled.connect(self.info_group.setVisible)
-
-        # Trim (single line)
-        trim_row = QHBoxLayout()
-        trim_row.setSpacing(6)
-        trim_row.setContentsMargins(0, 0, 0, 0)
-
-        trim_lbl = QLabel("TRIM:")
-        trim_lbl.setStyleSheet("color: #666; font: 8px 'SF Mono'; font-weight: bold;")
-        self.trim_start_lbl = QLabel("0.00s")
-        self.trim_start_lbl.setStyleSheet("color: #00d4ff; font: 9px 'SF Mono'; min-width: 45px;")
-        self.trim_end_lbl = QLabel("—")
-        self.trim_end_lbl.setStyleSheet("color: #00d4ff; font: 9px 'SF Mono'; min-width: 45px;")
-
-        reset_trim = QPushButton("⟲")
-        reset_trim.setFixedSize(26, 26)
-        reset_trim.setStyleSheet("background: #141420; color: #666; border: 1px solid #2a2a3a; border-radius: 3px; font: 11px; padding: 0px;")
-        reset_trim.clicked.connect(self._reset_trim)
-
-        trim_row.addWidget(trim_lbl, 0)
-        trim_row.addWidget(self.trim_start_lbl, 0)
-        trim_row.addWidget(QLabel("→"), 0)
-        trim_row.addWidget(self.trim_end_lbl, 0)
-        trim_row.addWidget(reset_trim, 0)
-        trim_row.addStretch()
-
-        # Speed (single line)
-        speed_row = QHBoxLayout()
-        speed_row.setSpacing(6)
-        speed_row.setContentsMargins(0, 0, 0, 0)
-
-        speed_lbl = QLabel("SPEED:")
-        speed_lbl.setStyleSheet("color: #666; font: 8px 'SF Mono'; font-weight: bold;")
-        self.speed_label = QLabel("1.0×")
-        self.speed_label.setStyleSheet("color: #ffb340; font: 10px 'SF Mono'; font-weight: bold; min-width: 35px;")
-
-        self.speed_combo = QComboBox()
-        self.speed_combo.addItems(["0.5×", "1.0×", "1.5×", "2.0×", "3.0×", "4.0×"])
-        self.speed_combo.setCurrentText("1.0×")
-        self.speed_combo.setFixedHeight(26)
-        self.speed_combo.setFixedWidth(75)
-        self.speed_combo.setStyleSheet("""
-            QComboBox {
-                background: #141420; color: #ccc; border: 1px solid #2a2a3a;
-                border-radius: 3px; padding: 2px 4px; font: 8px 'SF Mono';
-            }
-            QComboBox::drop-down { border: none; }
-            QComboBox::down-arrow { image: url(none); }
-        """)
-        self.speed_combo.currentTextChanged.connect(lambda t: self._set_speed(float(t[:-1])))
-
-        speed_row.addWidget(speed_lbl, 0)
-        speed_row.addWidget(self.speed_label, 0)
-        speed_row.addWidget(self.speed_combo, 0)
-        speed_row.addStretch()
-
-        # Add all control rows to a container
-        controls = QWidget()
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setSpacing(5)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-
-        info_row = QHBoxLayout()
-        info_row.addWidget(info_btn, 0)
-        info_row.addStretch()
-        controls_layout.addLayout(info_row)
-        controls_layout.addWidget(self.info_group)
-        controls_layout.addLayout(trim_row)
-        controls_layout.addLayout(speed_row)
-
-        # Speed slider
-        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(25, 800)
-        self.speed_slider.setValue(100)
-        self.speed_slider.setFixedHeight(12)
-        self.speed_slider.setStyleSheet("""
-            QSlider::groove:horizontal { background: #141420; border-radius: 3px; height: 3px; margin: 0px 0px; }
-            QSlider::handle:horizontal { background: #ffb340; border: none; width: 8px; margin: -4px 0px; border-radius: 4px; }
-        """)
-        self.speed_slider.valueChanged.connect(lambda v: self._set_speed(v / 100))
-        controls_layout.addWidget(self.speed_slider)
-
-        layout.addWidget(controls)
-        layout.addSpacing(6)
-
-        # ─── Main Blur Panel (takes most space) ────────────────────────────────
-
-        blur_label = QLabel("BLUR REGIONS")
-        blur_label.setStyleSheet("color: #666; font: 9px 'SF Mono'; letter-spacing: 1px; font-weight: bold;")
-        layout.addWidget(blur_label)
-
-        hint = QLabel("✎ Draw on video, adjust timing below")
-        hint.setStyleSheet("color: #444; font: 8px 'SF Pro Text';")
-        layout.addWidget(hint)
-
-        self.blur_panel = BlurPanel()
-        self.blur_panel.region_selected.connect(self._on_blur_selected)
-        self.blur_panel.region_removed.connect(self._remove_blur)
-        self.blur_panel.region_updated.connect(self._refresh_canvas)
-        layout.addWidget(self.blur_panel, stretch=1)
-
-        # ─── Export (fixed at bottom) ──────────────────────────────────────────
-
-        exp_row = QHBoxLayout()
-        exp_row.setSpacing(6)
-        exp_row.setContentsMargins(0, 0, 0, 0)
-
-        exp_row.addWidget(QLabel("Quality:"), 0)
-        self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["High", "Medium", "Low"])
-        self.quality_combo.setCurrentText("Medium")
-        self.quality_combo.setFixedHeight(28)
-        self.quality_combo.setStyleSheet("""
-            QComboBox {
-                background: #141420; color: #ccc; border: 1px solid #2a2a3a;
-                border-radius: 4px; padding: 2px 6px; font: 8px 'SF Mono';
-            }
-        """)
-        exp_row.addWidget(self.quality_combo, 0)
-        exp_row.addStretch()
-
-        layout.addSpacing(4)
-        layout.addLayout(exp_row)
-
-        return panel
-
-    def _setup_shortcuts(self):
-        QShortcut(QKeySequence("Space"), self, self._toggle_play)
-        QShortcut(QKeySequence("Left"), self, lambda: self._step_frame(-1))
-        QShortcut(QKeySequence("Right"), self, lambda: self._step_frame(1))
-        QShortcut(QKeySequence("Ctrl+O"), self, self._open_video)
-        QShortcut(QKeySequence("Ctrl+E"), self, self._export)
-        QShortcut(QKeySequence("B"), self, lambda: self.blur_draw_btn.setChecked(not self.blur_draw_btn.isChecked()))
-
-    # ─── Video Loading ────────────────────────────────────────────────────────
+    def _confirm_discard(self):
+        if not self.session.video_path or self.session == self._saved_session:
+            return True
+        choice = QMessageBox.question(
+            self,
+            "Save project?",
+            "Save your current editing settings before continuing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if choice == QMessageBox.StandardButton.Save:
+            return self._save_project()
+        return choice == QMessageBox.StandardButton.Discard
 
     def _open_video(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Screen Recording", os.path.expanduser("~/Movies"),
-            "Video Files (*.mp4 *.mov *.mkv *.avi *.m4v *.webm);;All Files (*)"
+            self,
+            "Open recording",
+            str(Path.home() / "Movies"),
+            "Video files (*.mp4 *.mov *.mkv *.avi *.m4v *.webm);;All files (*)",
         )
         if path:
             self._load_video(path)
 
-    def _load_video(self, path: str):
-        self.status.showMessage(f"Loading {os.path.basename(path)}…")
-        info = self._probe_video(path)
-        if not info:
-            QMessageBox.critical(self, "Error", "Could not read video file.")
+    def _load_video(self, path, restored=None, project_path=None):
+        if not self._confirm_discard():
             return
-
-        self.session = EditSession(
-            video_path=path,
-            duration=info['duration'],
-            width=info['width'],
-            height=info['height'],
-            fps=info['fps']
+        if not Path(path).is_file():
+            QMessageBox.warning(self, "Missing recording", f"Recording not found: {path}")
+            return
+        self.preview.pause()
+        self._generation += 1
+        generation = self._generation
+        for worker in (self._probe_worker, self._thumb_worker):
+            if worker and worker.isRunning():
+                worker.cancel()
+        self.status.showMessage("Reading recording…")
+        worker = self._track_worker(ProbeWorker(str(Path(path).resolve())))
+        self._probe_worker = worker
+        worker.ready.connect(
+            lambda info: self._finish_load(path, info, generation, restored, project_path)
         )
-        self.session.trim.end = info['duration']
+        worker.failed.connect(lambda error: self._load_failed(error, generation))
+        worker.start()
 
-        # Update UI
-        self.info_labels["File"].setText(os.path.basename(path))
-        self.info_labels["Duration"].setText(self._fmt_time(info['duration']))
-        self.info_labels["Resolution"].setText(f"{info['width']}×{info['height']}")
-        self.info_labels["FPS"].setText(f"{info['fps']:.2f}")
+    def _load_failed(self, error, generation):
+        if generation == self._generation:
+            QMessageBox.warning(self, "Could not open recording", error)
+            self.status.showMessage("Could not open recording")
 
-        self.timeline.duration = info['duration']
-        self.timeline.trim_start = 0
-        self.timeline.trim_end = info['duration']
-        self.timeline.current_time = 0
-        self.timeline.blur_regions = []
+    def _finish_load(self, path, info, generation, restored, project_path):
+        if generation != self._generation:
+            return
+        session = restored or EditSession()
+        session.video_path = str(Path(path).resolve())
+        for name in ("duration", "width", "height", "fps"):
+            setattr(session, name, info[name])
+        if restored is None:
+            session.trim.end = session.duration
+        try:
+            session = validate_session(session)
+        except ValueError as error:
+            self._load_failed(str(error), generation)
+            return
+        self.session = session
+        self._has_audio = info.get("has_audio", False)
+        self.project_path = project_path
+        self.history.reset(session)
+
+        self._saved_session = copy.deepcopy(session)
+        self.canvas.frame_pixmap = None
+        self.canvas.selected_blur_id = None
+        self.canvas.selected_annotation_id = None
+        self.canvas.annotation_tool = None
+        self.canvas.current_time = 0
+        self.blur_draw_btn.setChecked(False)
+        self._cancel_draw()
         self.timeline.thumbnails = []
-        self.timeline.update()
-
-        # Reset speed UI to match new session
-        self._set_speed(1.0)
-
-        self._seek_to(0)
-
-        # Enable buttons
-        for btn in [self.play_btn, self.prev_frame_btn, self.next_frame_btn,
-                    self.blur_draw_btn, self.export_btn,
-                    self.mark_start_btn, self.mark_end_btn]:
+        self.preview.open(session.video_path)
+        self._sync_session()
+        for btn in (
+            self.play_btn,
+            self.prev_frame_btn,
+            self.next_frame_btn,
+            self.blur_draw_btn,
+            self.export_btn,
+            self.mark_start_btn,
+            self.mark_end_btn,
+        ):
             btn.setEnabled(True)
+        self.status.showMessage(f"Loaded {Path(path).name}")
+        worker = self._track_worker(ThumbnailWorker(session.video_path, session.duration, 24))
+        self._thumb_worker = worker
+        worker.ready.connect(lambda thumbs: self._on_thumbnails(thumbs, generation))
+        worker.start()
 
-        self.trim_end_lbl.setText(self._fmt_time(info['duration']))
-        self.status.showMessage(f"Loaded: {os.path.basename(path)} — {self._fmt_time(info['duration'])}")
+    def _sync_session(self):
+        self._restoring = True
+        s = self.session
+        self.info_labels["File"].setText(Path(s.video_path).name)
+        self.info_labels["Duration"].setText(self._fmt_time(s.duration))
+        self.info_labels["Resolution"].setText(f"{s.width} × {s.height}")
+        self.info_labels["FPS"].setText(f"{s.fps:.2f}")
+        self.timeline.duration = s.duration
+        self.timeline.trim_start = s.trim.start
+        self.timeline.trim_end = s.trim.end or s.duration
+        self.trim_start_lbl.setText(self._fmt_time(s.trim.start))
+        self.trim_end_lbl.setText(self._fmt_time(s.trim.end or s.duration))
+        self._set_speed(s.speed)
+        self._refresh_canvas()
+        self._seek_to(max(s.trim.start, min(self.canvas.current_time, s.trim.end or s.duration)))
+        self._restoring = False
+        self._update_history_ui()
 
-        # Load thumbnails in background
-        self._thumb_worker = ThumbnailWorker(path, info['duration'], 24)
-        self._thumb_worker.ready.connect(self._on_thumbnails)
-        self._thumb_worker.start()
+    def _on_thumbnails(self, thumbs, generation):
+        if generation == self._generation:
+            self.timeline.thumbnails = [(t, QPixmap.fromImage(image)) for t, image in thumbs]
+            self.timeline.update()
 
-    def _probe_video(self, path: str) -> Optional[dict]:
-        try:
-            cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,r_frame_rate,duration",
-                "-of", "json", path
-            ]
-            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
-            data = json.loads(out)
-            stream = data['streams'][0]
-            fps_parts = stream['r_frame_rate'].split('/')
-            fps = float(fps_parts[0]) / float(fps_parts[1])
-            # Try container duration
-            dur = float(stream.get('duration', 0))
-            if not dur:
-                cmd2 = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                        "-of", "json", path]
-                out2 = subprocess.check_output(cmd2, stderr=subprocess.DEVNULL).decode()
-                dur = float(json.loads(out2)['format']['duration'])
-            return {
-                'width': int(stream['width']),
-                'height': int(stream['height']),
-                'fps': fps,
-                'duration': dur
-            }
-        except Exception as e:
-            print(f"Probe error: {e}")
-            return None
+    def _on_frame(self, image):
+        self.canvas.set_frame(QPixmap.fromImage(image))
 
-    @pyqtSlot(list)
-
-    def _probe_has_audio(self, path: str) -> bool:
-        try:
-            cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
-                   "-show_entries", "stream=codec_type", "-of", "json", path]
-            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
-            data = json.loads(out)
-            return len(data.get("streams", [])) > 0
-        except:
-            return False
-
-    def _on_thumbnails(self, thumbs):
-        self.timeline.thumbnails = thumbs
-        self.timeline.update()
-
-    # ─── Playback ─────────────────────────────────────────────────────────────
-
-    def _extract_frame(self, t: float) -> Optional[QPixmap]:
-        key = round(t, 2)
-        if key in self._frame_cache:
-            return self._frame_cache[key]
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                tmp = f.name
-            cmd = [
-                "ffmpeg", "-y", "-ss", f"{t:.4f}",
-                "-i", self.session.video_path,
-                "-vframes", "1",
-                "-vf", "scale=1280:-1",
-                "-q:v", "3", tmp
-            ]
-            subprocess.run(cmd, capture_output=True, timeout=4)
-            pix = QPixmap(tmp)
-            os.unlink(tmp)
-            if not pix.isNull():
-                # Keep cache small
-                if len(self._frame_cache) > 60:
-                    oldest = next(iter(self._frame_cache))
-                    del self._frame_cache[oldest]
-                self._frame_cache[key] = pix
-                return pix
-        except:
-            pass
-        return None
-
-    def _seek_to(self, t: float):
-        self.session.trim.start if hasattr(self.session, 'trim') else 0
-        pix = self._extract_frame(t)
-        if pix:
-            self.canvas.frame_pixmap = pix
+    def _on_position(self, t):
+        end = self.session.trim.end or self.session.duration
+        if self.playing and t >= end:
+            self.preview.pause()
+            self.preview.seek(end)
+            t = end
         self.canvas.current_time = t
-        self.canvas.blur_regions = self.session.blur_regions
-        self.canvas.update()
         self.timeline.current_time = t
+        self.canvas.update()
         self.timeline.update()
         self._update_time_label(t)
 
-    def _update_time_label(self, t: float):
-        self.time_label.setText(
-            f"{self._fmt_time(t)}  /  {self._fmt_time(self.session.duration)}"
-        )
+    def _on_playback(self, playing):
+        self.playing = playing
+        self.play_btn.setText("Ⅱ" if playing else "▶")
+
+    def _seek_to(self, t):
+        t = max(0, min(self.session.duration, t))
+        self.preview.seek(t)
+        self._on_position(t)
+
+    def _on_seek(self, t):
+        self.preview.pause()
+        self._seek_to(t)
 
     def _toggle_play(self):
         if not self.session.video_path:
             return
         if self.playing:
-            self._playback_timer.stop()
-            self.playing = False
-            self.play_btn.setText("▶")
+            self.preview.pause()
         else:
-            trim_end = self.session.trim.end if self.session.trim.end > 0 else self.session.duration
-            if self.canvas.current_time >= trim_end:
-                self.canvas.current_time = self.session.trim.start
-            self.playing = True
-            self.play_btn.setText("⏸")
-            self._last_play_time = time.time()
-            self._play_t = self.canvas.current_time
-            self._playback_timer.start()
+            end = self.session.trim.end or self.session.duration
+            if (
+                self.canvas.current_time >= end
+                or self.canvas.current_time < self.session.trim.start
+            ):
+                self._seek_to(self.session.trim.start)
+            self.preview.play()
 
-    def _advance_playback(self):
-        now = time.time()
-        dt = (now - self._last_play_time) * self.session.speed
-        self._last_play_time = now
-        self._play_t += dt
-        trim_end = self.session.trim.end if self.session.trim.end > 0 else self.session.duration
-        if self._play_t >= trim_end:
-            self._play_t = trim_end
-            self._playback_timer.stop()
-            self.playing = False
-            self.play_btn.setText("▶")
-        self._seek_to(self._play_t)
+    def _step_frame(self, direction):
+        if self.session.video_path:
+            self.preview.pause()
+            self._seek_to(self.canvas.current_time + direction / max(1, self.session.fps))
 
-    def _step_frame(self, direction: int):
+    def _update_time_label(self, t):
+        self.time_label.setText(f"{self._fmt_time(t)}  /  {self._fmt_time(self.session.duration)}")
+
+    def _record_change(self):
+        if self._restoring or not self.session.video_path:
+            return
+        self.history.record(self.session)
+        self._update_history_ui()
+
+    def _update_history_ui(self):
+        self.undo_btn.setEnabled(self.history.can_undo)
+        self.redo_btn.setEnabled(self.history.can_redo)
+        self.save_project_btn.setEnabled(bool(self.session.video_path))
+        name = (
+            Path(self.project_path).stem
+            if self.project_path
+            else Path(self.session.video_path).name
+        )
+        dirty = self.session.video_path and self.session != self._saved_session
+        self.project_label.setText((name or "Untitled project") + (" •" if dirty else ""))
+        self._update_export_summary()
+
+    def _undo(self):
+        session = self.history.undo()
+        if session is not None:
+            self.session = session
+            self._sync_session()
+
+    def _redo(self):
+        session = self.history.redo()
+        if session is not None:
+            self.session = session
+            self._sync_session()
+
+    def _save_project(self):
+        if not self.session.video_path:
+            return False
+        path = self.project_path
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save project",
+                str(Path(self.session.video_path).with_suffix(".screencut")),
+                "ScreenCut project (*.screencut)",
+            )
+        if not path:
+            return False
+        try:
+            save_project(path, self.session)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Could not save project", str(error))
+            return False
+
+        self.project_path = path
+        self._saved_session = copy.deepcopy(self.session)
+        self._update_history_ui()
+        self.status.showMessage("Project saved")
+        return True
+
+    def _open_project(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open project", str(Path.home()), "ScreenCut project (*.screencut *.json)"
+        )
+        if not path:
+            return
+        try:
+            session = load_project(path)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Could not open project", str(error))
+            return
+        if not Path(session.video_path).is_file():
+            replacement, _ = QFileDialog.getOpenFileName(self, "Locate missing source recording")
+            if not replacement:
+                return
+            session.video_path = replacement
+        self._load_video(session.video_path, session, path)
+
+    def _on_trim_changed(self, start, end):
         if not self.session.video_path:
             return
-        step = 1.0 / max(1, self.session.fps)
-        new_t = max(0, min(self.session.duration, self.canvas.current_time + direction * step))
-        self._seek_to(new_t)
-
-    @pyqtSlot(float)
-    def _on_seek(self, t: float):
-        self._seek_to(t)
-
-    @pyqtSlot(float, float)
-    def _on_trim_changed(self, start: float, end: float):
-        self.session.trim.start = start
-        self.session.trim.end = end
-        self.trim_start_lbl.setText(f"{start:.2f}s")
-        self.trim_end_lbl.setText(f"{end:.2f}s")
+        self.session.trim.start = max(0, min(start, end - 0.001))
+        self.session.trim.end = min(self.session.duration, max(end, start + 0.001))
+        self.trim_start_lbl.setText(self._fmt_time(self.session.trim.start))
+        self.trim_end_lbl.setText(self._fmt_time(self.session.trim.end))
+        self._record_change()
 
     def _reset_trim(self):
-        self.session.trim.start = 0
-        self.session.trim.end = self.session.duration
-        self.timeline.trim_start = 0
-        self.timeline.trim_end = self.session.duration
-        self.timeline.update()
-        self.trim_start_lbl.setText("0.00s")
-        self.trim_end_lbl.setText(self._fmt_time(self.session.duration))
+        if self.session.video_path:
+            self._on_trim_changed(0, self.session.duration)
+            self.timeline.trim_start = 0
+            self.timeline.trim_end = self.session.duration
+            self.timeline.update()
 
-    # ─── Blur ─────────────────────────────────────────────────────────────────
-
-    def _toggle_draw_mode(self, checked: bool):
+    def _toggle_draw_mode(self, checked):
         self.canvas.draw_mode = checked
+        self.canvas.setCursor(Qt.CursorShape.CrossCursor if checked else Qt.CursorShape.ArrowCursor)
         if checked:
-            self.canvas.setCursor(Qt.CursorShape.CrossCursor)
-            self.status.showMessage("Draw mode: drag on the video to place a blur region")
-        else:
-            self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
-            self.status.showMessage("Draw mode off")
+            for button in self.annotation_panel.add_buttons:
+                button.setChecked(False)
+            self.canvas.annotation_tool = None
+            self.canvas.selected_annotation_id = None
+            self.preview.pause()
+            self.status.showMessage("Drag over the recording to create a privacy region")
 
-    @pyqtSlot(float, float, float, float)
-    def _on_blur_drawn(self, x: float, y: float, w: float, h: float):
-        t = self.canvas.current_time
-        br = self.session.add_blur(x, y, w, h, t, min(t + 5.0, self.session.duration))
-        self._refresh_canvas()
+    def _on_blur_drawn(self, x, y, w, h):
+        t = min(self.canvas.current_time, max(0, self.session.duration - 0.01))
+        br = self.session.add_blur(x, y, w, h, t, min(t + 5, self.session.duration))
+        self.canvas.selected_blur_id = br.id
         self.blur_draw_btn.setChecked(False)
-        self.status.showMessage(f"Blur #{br.id+1} added — adjust start/end in the panel →")
+        self._on_region_updated()
+
+    def _cancel_draw(self):
+        self.blur_draw_btn.setChecked(False)
+        self.canvas.annotation_tool = None
+        self.canvas._drag_start = None
+        self.canvas._drag_rect = None
+        for button in self.annotation_panel.add_buttons:
+            button.setChecked(False)
+        self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+        self.canvas.update()
+
+    def _start_annotation(self, kind):
+        if not self.session.video_path:
+            return
+        self.blur_draw_btn.setChecked(False)
+        self.canvas.annotation_tool = kind
+        for button in self.annotation_panel.add_buttons:
+            button.setChecked(button.text().lower() == kind)
+        self.canvas.selected_blur_id = None
+        self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        self.preview.pause()
+        self.status.showMessage(
+            f"Drag on the preview to place {kind}. Use the Annotations tab to edit it."
+        )
+
+    def _on_annotation_drawn(self, kind, x, y, x2, y2):
+        t = min(self.canvas.current_time, max(0, self.session.duration - 0.01))
+        item = self.session.add_annotation(kind, x, y, x2, y2, t, min(t + 5, self.session.duration))
+        self._cancel_draw()
+        self.canvas.selected_annotation_id = item.id
+        self._on_region_updated()
+        self.effect_tabs.setCurrentWidget(self.annotation_panel)
+        if kind == "text":
+            self.annotation_panel.text.setFocus()
+            self.annotation_panel.text.selectAll()
+        self.status.showMessage(f"{kind.title()} added · edit appearance and timing in Annotations")
+
+    def _select_annotation(self, aid):
+        self.canvas.selected_annotation_id = aid
+        self.canvas.selected_blur_id = None
+        self.annotation_panel.refresh(self.session, aid)
+        self.effect_tabs.setCurrentWidget(self.annotation_panel)
+        self.canvas.update()
+
+    def _remove_annotation(self, aid):
+        self.session.annotations = [item for item in self.session.annotations if item.id != aid]
+        self.canvas.selected_annotation_id = None
+        self._on_region_updated()
+
+    def _mark_annotation(self, start):
+        for item in self.session.annotations:
+            if item.id == self.canvas.selected_annotation_id:
+                if start:
+                    item.start_time = min(self.canvas.current_time, item.end_time - 0.001)
+                else:
+                    item.end_time = max(self.canvas.current_time, item.start_time + 0.001)
+                self._on_region_updated()
+                return True
+        return False
 
     def _mark_blur_start(self):
-        if self.canvas.selected_blur_id is not None:
-            for br in self.session.blur_regions:
-                if br.id == self.canvas.selected_blur_id:
-                    br.start_time = self.canvas.current_time
-                    self._refresh_canvas()
-                    break
+        if self._mark_annotation(True):
+            return
+        for br in self.session.blur_regions:
+            if br.id == self.canvas.selected_blur_id:
+                br.start_time = max(0, min(self.canvas.current_time, br.end_time - 0.01))
+                self._on_region_updated()
+                break
 
     def _mark_blur_end(self):
-        if self.canvas.selected_blur_id is not None:
-            for br in self.session.blur_regions:
-                if br.id == self.canvas.selected_blur_id:
-                    br.end_time = self.canvas.current_time
-                    self._refresh_canvas()
-                    break
+        if self._mark_annotation(False):
+            return
+        for br in self.session.blur_regions:
+            if br.id == self.canvas.selected_blur_id:
+                br.end_time = min(
+                    self.session.duration, max(self.canvas.current_time, br.start_time + 0.01)
+                )
+                self._on_region_updated()
+                break
 
-    def _remove_blur(self, bid: int):
+    def _remove_blur(self, bid):
         self.session.remove_blur(bid)
-        self._refresh_canvas()
+        if self.canvas.selected_blur_id == bid:
+            self.canvas.selected_blur_id = None
+        self._on_region_updated()
 
-    @pyqtSlot(int)
-    def _on_blur_selected(self, bid: int):
+    def _on_blur_selected(self, bid):
+        self.canvas.selected_annotation_id = None
         self.canvas.selected_blur_id = bid
         self.canvas.update()
 
+    def _on_region_updated(self):
+        self._record_change()
+        self._refresh_canvas()
+
     def _refresh_canvas(self):
+        self.canvas.annotations = self.session.annotations
+        self.timeline.annotations = self.session.annotations
+        self.annotation_panel.refresh(self.session, self.canvas.selected_annotation_id)
         self.canvas.blur_regions = self.session.blur_regions
         self.canvas.update()
         self.timeline.blur_regions = self.session.blur_regions
         self.timeline.update()
         self.blur_panel.refresh(self.session, self.canvas.current_time)
 
-    # ─── Speed ────────────────────────────────────────────────────────────────
-
-    def _set_speed(self, speed: float):
-        self.session.speed = speed
-        self.speed_label.setText(f"{speed:.2f}×")
+    def _set_speed(self, speed):
+        self.session.speed = max(0.25, min(8, speed))
+        self.speed_label.setText(f"{self.session.speed:.2f}×")
         self.speed_slider.blockSignals(True)
-        self.speed_slider.setValue(int(speed * 100))
+        self.speed_slider.setValue(round(self.session.speed * 100))
         self.speed_slider.blockSignals(False)
-        # Sync dropdown
         self.speed_combo.blockSignals(True)
-        for i in range(self.speed_combo.count()):
-            if abs(float(self.speed_combo.itemText(i)[:-1]) - speed) < 0.01:
-                self.speed_combo.setCurrentIndex(i)
-                break
+        index = next(
+            (
+                i
+                for i in range(self.speed_combo.count())
+                if abs(float(self.speed_combo.itemText(i)[:-1]) - self.session.speed) < 0.001
+            ),
+            -1,
+        )
+        self.speed_combo.setCurrentIndex(index)
         self.speed_combo.blockSignals(False)
-
-    # ─── Export ───────────────────────────────────────────────────────────────
+        if hasattr(self, "preview"):
+            self.preview.set_rate(self.session.speed)
+        self._record_change()
 
     def _export(self):
-        if not self.session.video_path:
+        if not self.session.video_path or (self._export_worker and self._export_worker.isRunning()):
             return
-        src = Path(self.session.video_path)
-        default = str(src.parent / (src.stem + "_edited.mp4"))
+        try:
+            snapshot = validate_session(self.session)
+        except ValueError as error:
+            QMessageBox.warning(self, "Check editing settings", str(error))
+            return
+        src = Path(snapshot.video_path)
         out, _ = QFileDialog.getSaveFileName(
-            self, "Export Video", default, "MP4 Video (*.mp4)"
+            self, "Export video", str(src.with_name(src.stem + "_edited.mp4")), "MP4 video (*.mp4)"
         )
         if not out:
             return
-
-        # CRF from combo
-        crf_map = {"High": 18, "Medium": 23, "Low": 28}
-        crf = crf_map.get(self.quality_combo.currentText(), 23)
-
+        if Path(out).resolve() == src.resolve():
+            QMessageBox.warning(
+                self,
+                "Choose another filename",
+                "Export to a different file to preserve the source recording.",
+            )
+            return
+        self.preview.pause()
         self.progress_dlg = QProgressDialog("Preparing…", "Cancel", 0, 100, self)
-        self.progress_dlg.setWindowTitle("Exporting…")
+        self.progress_dlg.setWindowTitle("Export recording")
         self.progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress_dlg.setMinimumDuration(0)
-        self.progress_dlg.setValue(0)
-
-        self._export_worker = ExportWorker(self.session, out)
-        self._export_worker.has_audio = self._probe_has_audio(self.session.video_path)
-        self._export_worker.crf = crf
-        self._export_worker.progress.connect(
+        worker = self._track_worker(ExportWorker(snapshot, out))
+        self._export_worker = worker
+        worker.has_audio = self._has_audio
+        worker.crf = {"High": 18, "Medium": 23, "Low": 28}.get(self.quality_combo.currentText(), 23)
+        worker.progress.connect(
             lambda pct, msg: (self.progress_dlg.setValue(pct), self.progress_dlg.setLabelText(msg))
         )
-        self._export_worker.finished.connect(self._on_export_done)
-        self.progress_dlg.canceled.connect(self._export_worker.terminate)
-        self._export_worker.start()
+        worker.finished.connect(self._on_export_done)
+        self.progress_dlg.canceled.connect(worker.cancel)
+        worker.start()
 
-    @pyqtSlot(bool, str)
-    def _on_export_done(self, success: bool, info: str):
+    def _on_export_done(self, success, info):
         self.progress_dlg.close()
         if success:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Export Complete")
-            msg.setText(f"Video exported successfully!")
-            msg.setInformativeText(info)
-            msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-            msg.exec()
-            self.status.showMessage(f"Exported: {info}")
-        else:
-            QMessageBox.critical(self, "Export Failed", info)
-
-    # ─── Utilities ────────────────────────────────────────────────────────────
+            QMessageBox.information(self, "Export complete", f"Saved video to:\n{info}")
+        elif "cancel" not in info.lower():
+            QMessageBox.warning(self, "Export failed", info)
+        self.status.showMessage("Export complete" if success else info, 10000)
 
     @staticmethod
-    def _fmt_time(t: float) -> str:
-        mins = int(t) // 60
-        secs = int(t) % 60
-        cs = int((t % 1) * 100)
-        return f"{mins}:{secs:02d}.{cs:02d}"
+    def _fmt_time(t):
+        mins, seconds = divmod(max(0, t), 60)
+        return f"{int(mins)}:{seconds:05.2f}"
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path:
-                self._load_video(path)
-                break
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self._load_video(paths[0])
 
     def closeEvent(self, event):
-        if self._export_worker and self._export_worker.isRunning():
-            self._export_worker.terminate()
-        if self._thumb_worker and self._thumb_worker.isRunning():
-            self._thumb_worker.terminate()
+        if not self._confirm_discard():
+            event.ignore()
+            return
+        self._generation += 1
+        self.preview.close()
+        for worker in self._workers:
+            if worker.isRunning():
+                worker.cancel()
+        for worker in self._workers:
+            worker.wait()
         event.accept()
 
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
+def main():
+    if getattr(sys, "frozen", False):
+        os.environ["PATH"] = (
+            str(Path(sys._MEIPASS) / "bin") + os.pathsep + os.environ.get("PATH", "")
+        )
     app = QApplication(sys.argv)
     app.setApplicationName("ScreenCut")
     app.setOrganizationName("ScreenCut")
     window = ScreenCut()
     window.show()
-    sys.exit(app.exec())
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

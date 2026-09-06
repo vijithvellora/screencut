@@ -1,102 +1,93 @@
 #!/usr/bin/env python3
-"""
-Creates a proper macOS .app bundle for ScreenCut.
-Run once to install: python3 create_app.py
-Then drag ScreenCut.app to your Applications folder or Dock.
+"""Build a standalone macOS app with Python, Qt, and FFmpeg included.
+
+Install build tools with ``python -m pip install '.[bundle]'`` first.
+The bundle is generated in dist/ScreenCut.app; no Desktop app is replaced.
 """
 
-import os
-import sys
-import stat
-import shutil
+import importlib.util
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 
 APP_NAME = "ScreenCut"
 BUNDLE_ID = "com.screencut.editor"
 
-def create_app():
-    script_dir = Path(__file__).parent.resolve()
-    editor_py = script_dir / "editor.py"
 
-    if not editor_py.exists():
-        print(f"❌  editor.py not found at {editor_py}")
-        sys.exit(1)
+def create_app() -> int:
+    root = Path(__file__).resolve().parent
+    if sys.platform != "darwin":
+        print("A macOS .app must be built on macOS.", file=sys.stderr)
+        return 1
+    if sys.version_info < (3, 10):
+        print("Python 3.10 or newer is required.", file=sys.stderr)
+        return 1
+    for module in ("PyInstaller", "PyQt6"):
+        if importlib.util.find_spec(module) is None:
+            print(
+                f"Missing {module}. Activate your virtual environment, then run:\n"
+                "  python -m pip install '.[bundle]'",
+                file=sys.stderr,
+            )
+            return 1
+    binaries = []
+    for executable in ("ffmpeg", "ffprobe"):
+        path = shutil.which(executable)
+        if path is None:
+            print(f"Missing {executable}. Install with: brew install ffmpeg", file=sys.stderr)
+            return 1
+        binaries.extend(("--add-binary", f"{path}:bin"))
+    destination = root / "dist"
+    for output in (destination / f"{APP_NAME}.app", destination / APP_NAME):
+        if output.exists():
+            print(
+                f"Build output already exists: {output}\n"
+                "Move or remove the previous output before rebuilding.",
+                file=sys.stderr,
+            )
+            return 1
+    with tempfile.TemporaryDirectory(prefix="screencut-build-") as temporary:
+        command = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--clean",
+            "--onedir",
+            "--windowed",
+            "--name",
+            APP_NAME,
+            "--osx-bundle-identifier",
+            BUNDLE_ID,
+            "--distpath",
+            str(destination),
+            "--workpath",
+            str(Path(temporary) / "work"),
+            "--specpath",
+            temporary,
+            "--paths",
+            str(root),
+            "--collect-submodules",
+            "screencut",
+            *binaries,
+            str(root / "editor.py"),
+        ]
+        try:
+            subprocess.run(command, cwd=root, check=True)
+        except subprocess.CalledProcessError as error:
+            print(
+                f"App build failed (exit {error.returncode}). See build output above.",
+                file=sys.stderr,
+            )
+            return error.returncode
+    print(
+        f"Created: {destination / (APP_NAME + '.app')}\n"
+        "Python, Qt, FFmpeg, and FFprobe are included.\n"
+        "Test on a clean Mac before distribution; signing/notarization is a separate step."
+    )
+    return 0
 
-    # Output: ~/Desktop/ScreenCut.app
-    desktop = Path.home() / "Desktop"
-    app_path = desktop / f"{APP_NAME}.app"
-
-    if app_path.exists():
-        shutil.rmtree(app_path)
-
-    # Build structure
-    contents = app_path / "Contents"
-    macos = contents / "MacOS"
-    resources = contents / "Resources"
-    macos.mkdir(parents=True)
-    resources.mkdir(parents=True)
-
-    # Info.plist
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleExecutable</key>
-  <string>{APP_NAME}</string>
-  <key>CFBundleIdentifier</key>
-  <string>{BUNDLE_ID}</string>
-  <key>CFBundleName</key>
-  <string>{APP_NAME}</string>
-  <key>CFBundleDisplayName</key>
-  <string>ScreenCut</string>
-  <key>CFBundleVersion</key>
-  <string>1.0</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>NSHighResolutionCapable</key>
-  <true/>
-  <key>NSRequiresAquaSystemAppearance</key>
-  <false/>
-  <key>LSMinimumSystemVersion</key>
-  <string>12.0</string>
-  <key>CFBundleSupportedPlatforms</key>
-  <array><string>MacOSX</string></array>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>ScreenCut uses AppleEvents for video processing.</string>
-</dict>
-</plist>"""
-    (contents / "Info.plist").write_text(plist)
-
-    # Copy editor.py into Resources
-    dest_py = resources / "editor.py"
-    shutil.copy(editor_py, dest_py)
-
-    # Executable launcher
-    py3 = shutil.which("python3") or "/usr/bin/python3"
-    launcher = f"""#!/bin/bash
-# ScreenCut macOS launcher
-export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
-
-# Check ffmpeg
-if ! command -v ffmpeg &>/dev/null; then
-    osascript -e 'display alert "ffmpeg not found" message "Install via Homebrew: brew install ffmpeg" as warning'
-    exit 1
-fi
-
-# Install PyQt6 if needed
-{py3} -c "import PyQt6" 2>/dev/null || pip3 install PyQt6 --quiet
-
-SCRIPT="$(dirname "$0")/../Resources/editor.py"
-exec {py3} "$SCRIPT"
-"""
-    launcher_path = macos / APP_NAME
-    launcher_path.write_text(launcher)
-    launcher_path.chmod(launcher_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-    print(f"✅  Created: {app_path}")
-    print(f"   Drag ScreenCut.app to your Applications folder or Dock.")
-    print(f"   First launch may require: right-click → Open (to bypass Gatekeeper)")
 
 if __name__ == "__main__":
-    create_app()
+    raise SystemExit(create_app())
